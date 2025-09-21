@@ -1,17 +1,4 @@
-pub type Price = i32;
-pub type Quantity = u32;
-pub type OrderId = u64;
-
-pub enum OrderType {
-    GoodTilCancel,
-    ImmediateOrCancel,
-    FillAndKill,
-}
-
-pub enum Side {
-    Buy,
-    Sell,
-}
+use crate::orderbook::types::{Price, Quantity};
 
 #[derive(Debug)]
 pub struct LevelInfo {

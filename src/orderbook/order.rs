@@ -1,5 +1,6 @@
 use crate::orderbook::custom_errors::QuantityError;
-use crate::orderbook::models::{OrderId, OrderType, Price, Quantity, Side};
+use crate::orderbook::enums::{OrderType, Side};
+use crate::orderbook::types::{OrderId, Price, Quantity};
 
 pub struct Order {
     order_type: OrderType,
