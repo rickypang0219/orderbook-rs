@@ -1,3 +1,5 @@
-pub type Price = i32;
-pub type Quantity = u32;
-pub type OrderId = u64;
+use uuid::Uuid;
+
+pub type Price = i64;
+pub type Quantity = u64;
+pub type OrderId = Uuid;
