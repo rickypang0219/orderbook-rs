@@ -14,7 +14,7 @@ pub struct OrderBook {
     orders: HashMap<OrderId, OrderEntry>,
 }
 ```
-The `Reverse` indicates that the BTreeMap searches price from largest to smallest number. This helps us to get the best bid price by `iter().next()` method easily, which is different from `fjmurcia` implementation design and similar to `CodingJesus` implementation in C++ with
+The `Reverse` indicates that the BTreeMap searches price from largest to smallest number. This helps us to get the best bid price by `iter().next()` method easily, which is different from `fjmurcia` implementation design but similar/closer to [CodingJesus bids order map implementation](https://github.com/Tzadiko/Orderbook/blob/dd136dd219ead95796f0e396e9e1395542bf673f/Orderbook.h#L39C5-L39C63) with
 ```c
 std::map<Price, OrderPointers, std::greater<Price>> bids_;
 
