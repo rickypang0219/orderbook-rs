@@ -1,74 +1,110 @@
-use crate::orderbook::custom_errors::QuantityError;
-use crate::orderbook::models::{OrderId, OrderType, Price, Quantity, Side};
+use chrono::Utc;
+use std::rc::Rc;
+use uuid::Uuid;
 
+use crate::orderbook::custom_errors::QuantityError;
+use crate::orderbook::types::{Price, Quantity};
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum OrderType {
+    LimitOrder,
+    MarketOrder,
+    ImmediateOrCancel,
+    FillOrKill,
+    GoodTillCancel,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Status {
+    New,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+}
+
+#[derive(Debug, Clone)]
 pub struct Order {
-    order_type: OrderType,
-    order_id: OrderId,
-    side: Side,
+    pub order_type: OrderType,
+    pub order_id: Uuid, // use uuid to replace u64
+    pub side: Side,
+    pub price: Price,
+    pub status: Status,
+    pub original_quantity: Quantity,
+    pub executed_quantity: Quantity,
+    pub remaining_quantity: Quantity,
+    pub timestamp: i64,
+}
+
+pub struct ModifyOrder {
+    // order type by default Limit order / GTC
+    order_id: Uuid,
     price: Price,
-    initial_quantity: Quantity,
-    remaining_quantity: Quantity,
+    quantity: Quantity,
+    side: Side,
+    timestamp: i64,
 }
 
 impl Order {
-    pub fn init_order(
+    pub fn new(
         order_type: OrderType,
-        order_id: OrderId,
         side: Side,
         price: Price,
-        initial_quantity: Quantity,
-        remaining_quantity: Quantity,
+        original_quantity: Quantity,
     ) -> Self {
         Order {
             order_type,
-            order_id,
+            order_id: Uuid::new_v4(),
             side,
             price,
-            initial_quantity,
-            remaining_quantity,
+            status: Status::New,
+            original_quantity,
+            executed_quantity: 0,
+            remaining_quantity: original_quantity,
+            timestamp: Utc::now().timestamp_millis(),
         }
-    }
-
-    pub fn get_side(&self) -> &Side {
-        &self.side
-    }
-
-    pub fn get_order_type(&self) -> &OrderType {
-        &self.order_type
-    }
-
-    pub fn get_price(&self) -> &Price {
-        &self.price
-    }
-
-    pub fn get_order_id(&self) -> &OrderId {
-        &self.order_id
-    }
-
-    pub fn get_init_qty(&self) -> &Quantity {
-        &self.initial_quantity
-    }
-
-    pub fn get_remaining_qty(&self) -> &Quantity {
-        &self.remaining_quantity
-    }
-
-    pub fn get_filled_qty(self) -> Quantity {
-        *self.get_init_qty() - *self.get_remaining_qty()
     }
 
     pub fn fill_qty(&mut self, quantity: Quantity) -> Result<(), QuantityError> {
-        if *self.get_remaining_qty() < quantity {
+        if (self.original_quantity - self.executed_quantity) < quantity {
             Err(QuantityError {
                 message: format!(
                     "Quantity Error: remaining quantity {} ; fill quantity {}",
-                    self.remaining_quantity, quantity,
+                    (self.original_quantity - self.executed_quantity),
+                    quantity,
                 ),
             })
         } else {
-            self.remaining_quantity -= quantity;
+            self.executed_quantity += quantity;
+            self.remaining_quantity = self.original_quantity - self.executed_quantity;
             Ok(())
         }
+    }
+
+    pub fn is_filled(self) -> bool {
+        // follow up: modify order state to filled
+        self.remaining_quantity == 0
+    }
+}
+
+impl ModifyOrder {
+    fn new(order_id: Uuid, price: Price, quantity: Quantity, side: Side) -> Self {
+        let now = Utc::now().timestamp_millis();
+        ModifyOrder {
+            order_id,
+            price,
+            quantity,
+            side,
+            timestamp: now,
+        }
+    }
+    pub fn to_order_ptr(&self, order_type: OrderType) -> Rc<Order> {
+        Rc::new(Order::new(order_type, self.side, self.price, self.quantity))
     }
 }
 
@@ -77,45 +113,21 @@ mod order_tests {
     use super::*;
 
     #[test]
-    fn check_get_price() {
-        let order: Order =
-            Order::init_order(OrderType::GoodTilCancel, 1234567890, Side::Buy, 100, 10, 10);
-        assert_eq!(*order.get_price(), 100);
+    fn check_new_order() {
+        let test_order: Order = Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10);
+        assert_eq!(test_order.price, 100);
+        assert_eq!(test_order.order_type, OrderType::GoodTillCancel);
+        assert_eq!(test_order.side, Side::Buy);
+        assert_eq!(test_order.original_quantity, 10);
+        assert_eq!(test_order.executed_quantity, 0);
     }
 
     #[test]
-    fn check_init_qty() {
-        let order: Order =
-            Order::init_order(OrderType::GoodTilCancel, 1234567890, Side::Buy, 100, 10, 10);
-        assert_eq!(*order.get_init_qty(), 10);
-    }
-
-    #[test]
-    fn check_remain_qty() {
-        let order: Order =
-            Order::init_order(OrderType::GoodTilCancel, 1234567890, Side::Buy, 100, 10, 10);
-        assert_eq!(*order.get_remaining_qty(), 10);
-    }
-
-    #[test]
-    fn check_valid_fill_qty() {
-        let mut order: Order =
-            Order::init_order(OrderType::GoodTilCancel, 1234567890, Side::Buy, 100, 10, 10);
-        assert_eq!(order.fill_qty(5).unwrap(), ());
-    }
-
-    #[test]
-    fn check_invalid_fill_qty() {
-        let mut order: Order =
-            Order::init_order(OrderType::GoodTilCancel, 1234567890, Side::Buy, 100, 10, 10);
-        assert!(order.fill_qty(11).is_err());
-    }
-
-    #[test]
-    fn check_remain_qty_after_fill() {
-        let mut order: Order =
-            Order::init_order(OrderType::GoodTilCancel, 1234567890, Side::Buy, 100, 10, 10);
-        let _fill5 = order.fill_qty(10);
-        assert_eq!(*order.get_remaining_qty(), 0);
+    fn check_fill_quantity() {
+        let mut test_order: Order = Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10);
+        let _ = test_order.fill_qty(10);
+        assert_eq!(test_order.executed_quantity, 10);
+        assert_eq!(test_order.remaining_quantity, 0);
+        assert_eq!(test_order.is_filled(), true);
     }
 }
