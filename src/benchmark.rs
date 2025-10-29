@@ -107,6 +107,68 @@ fn benchmark_cancel_orders(num_orders: u64) {
     println!("  Latency: {:.3} μs/cancel\n", latency_us);
 }
 
+fn benchmark_match_orders(num_orders: u64) {
+    let mut orderbook = OrderBook::new();
+
+    // Set up random number generator for quantities
+    let mut rng = thread_rng();
+    let qty_dist = Uniform::new_inclusive(1, 100); // Quantity range [1, 100]
+
+    // Fill one side of the book with buy orders
+    for _ in 0..num_orders / 2 {
+        let order = Arc::new(Order::new(
+            OrderType::GoodTillCancel,
+            Side::Buy,
+            100,                       // Fixed price
+            qty_dist.sample(&mut rng), // Random quantity
+        ));
+        orderbook.add_order(&order).unwrap(); // Assume no matching for buy orders
+    }
+
+    let mut trades_executed: u64 = 0;
+    let start = Instant::now();
+
+    // Add matching sell orders and measure matching speed
+    for _ in num_orders / 2..num_orders {
+        let order = Arc::new(Order::new(
+            OrderType::GoodTillCancel,
+            Side::Sell,
+            100,                       // Fixed price to match buy orders
+            qty_dist.sample(&mut rng), // Random quantity
+        ));
+        let trades = orderbook.add_order(&order).unwrap();
+        trades_executed += trades.len() as u64; // Count number of trades
+    }
+
+    let duration = start.elapsed();
+
+    // Calculate metrics
+    let seconds = duration.as_secs_f64(); // Duration in seconds
+    let matches_per_sec = if seconds > 0.0 {
+        ((num_orders / 2) as f64 / seconds) as u64
+    } else {
+        0
+    };
+    let trades_per_sec = if seconds > 0.0 {
+        (trades_executed as f64 / seconds) as u64
+    } else {
+        0
+    };
+
+    // Print results
+    println!("Match {} orders:", format_number(num_orders / 2));
+    println!("  Time: {:.2} ms", duration.as_micros() as f64 / 1000.0);
+    println!("  Trades executed: {}", format_number(trades_executed));
+    println!(
+        "  Throughput: {} matches/sec",
+        format_number(matches_per_sec)
+    );
+    println!(
+        "  Trade rate: {} trades/sec\n",
+        format_number(trades_per_sec)
+    );
+}
+
 fn main() {
     // Example: Benchmark with 1000 orders
     let num_orders: u64 = 1000;
@@ -118,4 +180,5 @@ fn main() {
 
     benchmark_add_orders(num_orders);
     benchmark_cancel_orders(num_orders);
+    benchmark_match_orders(num_orders);
 }
