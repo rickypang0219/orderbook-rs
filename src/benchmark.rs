@@ -170,10 +170,8 @@ fn benchmark_match_orders(num_orders: u64) {
 }
 
 fn main() {
-    // Example: Benchmark with 1000 orders
-    let num_orders: u64 = 1000;
+    let num_orders: u64 = 1_000;
 
-    // Init Logger
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
         .init();
