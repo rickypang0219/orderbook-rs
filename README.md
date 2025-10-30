@@ -47,24 +47,3 @@ and you can see AddOrders/CancelOrders/MatchOrders latency, throughput, and trad
 
 # Future Improvements
 - WebSocket Data Feed with Binance Futures
-- Do not store PriceLevel inside BTreeMap
-
-```rust
-#[derive(Clone, Copy, Debug)]
-struct PriceLevelRef {
-    index: usize,  // Index into the price_levels vector
-    price: Price,  // Copy of the price for quick comparison
-}
-
-// Without PriceLevelRef - PROBLEMATIC:
-struct BadDesign {
-    bids: BTreeMap<Reverse<Price>, PriceLevel>,  // Large objects in tree!
-    // Every tree rebalance moves entire PriceLevel objects!
-}
-
-// With PriceLevelRef - OPTIMAL:
-struct GoodDesign {
-    bids: BTreeMap<Reverse<Price>, PriceLevelRef>,  // Tiny references in tree
-    price_levels: Vec<PriceLevel>,  // Stable storage location
-}
-```
