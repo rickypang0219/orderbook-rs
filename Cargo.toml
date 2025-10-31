@@ -13,6 +13,10 @@ intrusive-collections = "^0.9.7"
 rand = "0.8"
 
 
+[profile.release]
+debug = true
+
+
 
 [[bin]]
 name = "main"

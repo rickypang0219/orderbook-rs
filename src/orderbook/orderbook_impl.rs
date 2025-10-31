@@ -140,7 +140,7 @@ impl OrderBook {
         };
     }
     // Should rename to handle order
-    pub fn add_order(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
+    pub fn add_order(&mut self, order: &Arc<Order>) -> Result<Vec<Option<Trade>>, OrderBookError> {
         if self.orders.contains_key(&order.order_id) {
             return Err(OrderBookError::OrderAlreadyExists {
                 order_id: order.order_id,
@@ -152,13 +152,13 @@ impl OrderBook {
             });
         }
 
-        let mut trades: Vec<Trade> = Vec::with_capacity(self.orders.len());
+        let mut trades: Vec<Option<Trade>> = Vec::with_capacity(self.orders.len());
 
         match order.order_type {
-            OrderType::MarketOrder => trades = self.match_market(order)?,
+            OrderType::MarketOrder => trades = self.match_market(order).unwrap(),
             OrderType::ImmediateOrCancel => {}
-            OrderType::FillOrKill => trades = self.match_fill_or_kill(order)?,
-            _ => trades = self.match_and_add_to_book(order)?,
+            OrderType::FillOrKill => trades = self.match_fill_or_kill(order).unwrap(),
+            _ => trades = self.match_and_add_to_book(order).unwrap(),
         }
 
         Ok(trades)
@@ -199,8 +199,8 @@ impl OrderBook {
         Ok(())
     }
 
-    fn match_order(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        let mut trades: Vec<Trade> = Vec::with_capacity(self.orders.len());
+    fn match_order(&mut self, order: &Arc<Order>) -> Result<Vec<Option<Trade>>, OrderBookError> {
+        let mut trades: Vec<Option<Trade>> = Vec::with_capacity(self.orders.len());
         let order_price: Price = order.price;
         let mut remaining_quantity: Quantity = order.remaining_quantity;
         let order_type: OrderType = order.order_type;
@@ -216,10 +216,11 @@ impl OrderBook {
                     };
 
                     if order_price >= best_ask || order_type == OrderType::MarketOrder {
-                        let trade =
-                            self.match_at_price_level(best_ask, order, remaining_quantity)?;
+                        let trade = self
+                            .match_at_price_level_optimized(best_ask, order, remaining_quantity)
+                            .unwrap();
                         remaining_quantity -= trade.quantity;
-                        trades.push(trade);
+                        trades.push(Some(trade));
                     } else {
                         break;
                     };
@@ -237,10 +238,11 @@ impl OrderBook {
                     };
 
                     if order_price <= best_bid || order_type == OrderType::MarketOrder {
-                        let trade =
-                            self.match_at_price_level(best_bid, order, remaining_quantity)?;
+                        let trade = self
+                            .match_at_price_level_optimized(best_bid, order, remaining_quantity)
+                            .unwrap();
                         remaining_quantity -= trade.quantity;
-                        trades.push(trade);
+                        trades.push(Some(trade));
                     } else {
                         break;
                     };
@@ -351,37 +353,111 @@ impl OrderBook {
 
         //1️⃣ Remove empty price level if needed
         if target_level.orders.is_empty() {
-            match order.side {
-                Side::Buy => {
-                    if let Some(price_level_ref) = self.asks.remove(&best_price) {
-                        // reset to None
-                        self.price_levels[price_level_ref.index] = None;
-                        // store index for later reuse
-                        self.free_indices.push_back(index);
-                        // remove by_price
-                        self.by_price.remove(&best_price);
-                    } else {
-                        return Err(OrderBookError::PriceLevelNotFound { price: best_price });
-                    }
-                }
-                Side::Sell => {
-                    if let Some(price_level_ref) = self.bids.remove(&Reverse(best_price)) {
-                        self.price_levels[price_level_ref.index] = None;
-                        self.free_indices.push_back(index);
-                        self.by_price.remove(&best_price);
-                    } else {
-                        return Err(OrderBookError::PriceLevelNotFound { price: best_price });
-                    }
-                }
-            }
+            self.remove_empty_price_level(best_price, order);
         };
         Ok(trade)
     }
 
-    fn match_and_add_to_book(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        let trades: Vec<Trade> = self.match_order(order).unwrap();
+    fn match_at_price_level_optimized(
+        &mut self,
+        best_price: Price,
+        incoming_order: &Arc<Order>,
+        max_quantity: Quantity,
+    ) -> Option<Trade> {
+        let level_ref = match incoming_order.side {
+            Side::Buy => self.asks.get(&best_price)?,
+            Side::Sell => self.bids.get(&Reverse(best_price))?,
+        };
 
-        let traded_quantity: Quantity = trades.iter().map(|t| t.quantity).sum();
+        let level_index = level_ref.index;
+        let price_level = self.price_levels[level_index].as_mut()?;
+
+        // Get front order info
+        let front_cursor = price_level.orders.front();
+        let node_ptr = front_cursor
+            .get()
+            .map(|node| node as *const OrderNode as *mut OrderNode)?;
+        let node_ptr = unsafe { NonNull::new_unchecked(node_ptr) };
+
+        // Create cursor from pointer for mutation
+        let mut cursor = unsafe { price_level.orders.cursor_mut_from_ptr(node_ptr.as_ptr()) };
+
+        let resting_order = cursor.get()?.order.clone();
+        let trade_quantity = max_quantity.min(resting_order.remaining_quantity);
+        let trade_price = best_price;
+
+        let trade = Trade::new(
+            incoming_order.order_id,
+            resting_order.order_id,
+            trade_price,
+            trade_quantity,
+        );
+
+        if trade_quantity == resting_order.remaining_quantity {
+            // Full fill - remove order
+            cursor.remove();
+            price_level.volume -= trade_quantity;
+            price_level.order_count -= 1;
+            self.orders.remove(&resting_order.order_id);
+        } else {
+            // Partial fill - update using cursor.replace()
+            let new_quantity = resting_order.remaining_quantity - trade_quantity;
+            let mut updated_order = (*resting_order).clone();
+            updated_order.remaining_quantity = new_quantity;
+            updated_order.executed_quantity += trade_quantity;
+            updated_order.status = Status::PartiallyFilled;
+
+            let updated_node = Box::new(OrderNode::new(Arc::new(updated_order)));
+            cursor.replace_with(updated_node);
+
+            price_level.volume -= trade_quantity;
+        }
+
+        if price_level.orders.is_empty() {
+            self.remove_empty_price_level(best_price, incoming_order);
+        }
+
+        Some(trade)
+    }
+
+    fn remove_empty_price_level(
+        &mut self,
+        price: Price,
+        order: &Arc<Order>,
+    ) -> Result<(), OrderBookError> {
+        match order.side {
+            Side::Buy => {
+                if let Some(price_level_ref) = self.asks.remove(&price) {
+                    // reset to None
+                    self.price_levels[price_level_ref.index] = None;
+                    // store index for later reuse
+                    self.free_indices.push_back(price_level_ref.index);
+                    // remove by_price
+                    self.by_price.remove(&price);
+                } else {
+                    return Err(OrderBookError::PriceLevelNotFound { price });
+                }
+            }
+            Side::Sell => {
+                if let Some(price_level_ref) = self.bids.remove(&Reverse(price)) {
+                    self.price_levels[price_level_ref.index] = None;
+                    self.free_indices.push_back(price_level_ref.index);
+                    self.by_price.remove(&price);
+                } else {
+                    return Err(OrderBookError::PriceLevelNotFound { price });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn match_and_add_to_book(
+        &mut self,
+        order: &Arc<Order>,
+    ) -> Result<Vec<Option<Trade>>, OrderBookError> {
+        let trades: Vec<Option<Trade>> = self.match_order(order).unwrap();
+
+        let traded_quantity: Quantity = trades.iter().map(|t| t.as_ref().unwrap().quantity).sum();
         let remaining_quantity = order.remaining_quantity - traded_quantity;
 
         if remaining_quantity > 0 {
@@ -393,7 +469,7 @@ impl OrderBook {
         Ok(trades)
     }
 
-    fn match_market(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
+    fn match_market(&mut self, order: &Arc<Order>) -> Result<Vec<Option<Trade>>, OrderBookError> {
         let aggressive_price = match order.side {
             Side::Buy => Price::MAX, // buy at any price
             Side::Sell => 0,         // sell at any price
@@ -404,7 +480,10 @@ impl OrderBook {
         self.match_order(&Arc::new(order_arc))
     }
 
-    fn match_fill_or_kill(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
+    fn match_fill_or_kill(
+        &mut self,
+        order: &Arc<Order>,
+    ) -> Result<Vec<Option<Trade>>, OrderBookError> {
         let available_quantity: Quantity = self.get_available_quantity(order);
 
         if available_quantity <= order.original_quantity {
