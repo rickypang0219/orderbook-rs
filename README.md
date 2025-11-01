@@ -47,3 +47,14 @@ and you can see AddOrders/CancelOrders/MatchOrders latency, throughput, and trad
 
 # Future Improvements
 - WebSocket Data Feed with Binance Futures
+- Replace Linked List by VecDeque (similar to ring buffer approach)
+```rust
+orders: LinkedList<OrderNode>
+
+new_orders: VecDeque<Option<OrderNode>> // may be fixed size array
+
+// O(1) removal -> set the VecDeque[index] to None, and release the index/indices for rewrite
+// better cache friendiness since continguous memory, no allocation if we use fixed size array
+// cancel order does not mean we have to really remove the data, setting to None and update the price level correctly then done
+
+```
