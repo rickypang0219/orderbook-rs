@@ -2,7 +2,7 @@ use std::boxed::Box;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::orderbook::order::Order;
+use crate::orderbook::order::{Order, Status};
 use crate::orderbook::types::{OrderId, Price, Quantity};
 
 use intrusive_collections::linked_list::CursorMut;
@@ -171,6 +171,36 @@ impl PriceLevel {
         LevelInfo {
             price: self.price,
             volume: self.volume,
+        }
+    }
+
+    pub fn update_front_order_quantity(&mut self, new_quantity: Quantity) -> Option<Quantity> {
+        let mut cursor = self.orders.front_mut();
+
+        if let Some(front_node) = cursor.get() {
+            let old_quantity = front_node.order.remaining_quantity;
+            let delta = old_quantity as i64 - new_quantity as i64;
+
+            // Create updated order
+            let mut updated_order = (*front_node.order).clone();
+            updated_order.remaining_quantity = new_quantity;
+            updated_order.executed_quantity += delta.max(0) as Quantity;
+            updated_order.status = if new_quantity == 0 {
+                Status::Filled
+            } else {
+                Status::PartiallyFilled
+            };
+
+            // Replace the node using cursor.replace()
+            let updated_node = Box::new(OrderNode::new(Arc::new(updated_order)));
+            let _ = cursor.replace_with(updated_node);
+
+            // Update price level volume
+            self.volume = self.volume.saturating_sub(delta.unsigned_abs());
+
+            Some(old_quantity)
+        } else {
+            None
         }
     }
 }

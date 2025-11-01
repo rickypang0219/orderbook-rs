@@ -47,24 +47,14 @@ and you can see AddOrders/CancelOrders/MatchOrders latency, throughput, and trad
 
 # Future Improvements
 - WebSocket Data Feed with Binance Futures
-- Do not store PriceLevel inside BTreeMap
-
+- Replace Linked List by VecDeque (similar to ring buffer approach)
 ```rust
-#[derive(Clone, Copy, Debug)]
-struct PriceLevelRef {
-    index: usize,  // Index into the price_levels vector
-    price: Price,  // Copy of the price for quick comparison
-}
+orders: LinkedList<OrderNode>
 
-// Without PriceLevelRef - PROBLEMATIC:
-struct BadDesign {
-    bids: BTreeMap<Reverse<Price>, PriceLevel>,  // Large objects in tree!
-    // Every tree rebalance moves entire PriceLevel objects!
-}
+new_orders: VecDeque<Option<OrderNode>> // may be fixed size array
 
-// With PriceLevelRef - OPTIMAL:
-struct GoodDesign {
-    bids: BTreeMap<Reverse<Price>, PriceLevelRef>,  // Tiny references in tree
-    price_levels: Vec<PriceLevel>,  // Stable storage location
-}
+// O(1) removal -> set the VecDeque[index] to None, and release the index/indices for rewrite
+// better cache friendiness since continguous memory, no allocation if we use fixed size array
+// cancel order does not mean we have to really remove the data, setting to None and update the price level correctly then done
+
 ```
