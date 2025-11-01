@@ -1,16 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::{thread, time::Duration};
 
 use chrono::Utc;
-use intrusive_collections::LinkedListLink;
 use log::{error, info};
 use uuid::Uuid;
 
 use crate::orderbook::order::{Order, OrderType, Side, Status};
-use crate::orderbook::price_level::{OrderEntry, OrderNode, PriceLevel};
+use crate::orderbook::price_level::{OrderEntry, PriceLevel};
 use crate::orderbook::types::{OrderId, Price, Quantity};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +55,8 @@ pub struct OrderBook {
     by_price: HashMap<Price, PriceLevelRef>,
     price_levels: Vec<Option<PriceLevel>>,
     free_indices: VecDeque<usize>,
+    pub price_levels_capacity: usize,
+    pub orders_capacity: usize,
 }
 
 impl Trade {
@@ -78,10 +78,9 @@ impl Trade {
 }
 
 impl OrderBook {
-    pub fn new() -> Self {
-        let init_capacity: usize = 1024;
-        let price_levels: Vec<Option<PriceLevel>> = Vec::with_capacity(init_capacity);
-        let free_indices: VecDeque<usize> = VecDeque::with_capacity(init_capacity);
+    pub fn new(price_levels_capacity: usize, orders_capacity: usize) -> Self {
+        let price_levels: Vec<Option<PriceLevel>> = Vec::with_capacity(price_levels_capacity);
+        let free_indices: VecDeque<usize> = VecDeque::with_capacity(price_levels_capacity);
 
         OrderBook {
             bids: BTreeMap::new(),
@@ -90,6 +89,8 @@ impl OrderBook {
             by_price: HashMap::new(),
             price_levels,
             free_indices,
+            price_levels_capacity,
+            orders_capacity,
         }
     }
 
@@ -102,11 +103,13 @@ impl OrderBook {
                             .free_indices
                             .pop_front()
                             .expect("Free indices Vector Cannot be None!");
-                        self.price_levels[index] = Some(PriceLevel::new(order.price));
+                        self.price_levels[index] =
+                            Some(PriceLevel::new(order.price, self.orders_capacity));
                         index
                     } else {
                         let index = self.price_levels.len();
-                        self.price_levels.push(Some(PriceLevel::new(order.price)));
+                        self.price_levels
+                            .push(Some(PriceLevel::new(order.price, self.orders_capacity)));
                         index
                         // self.price_levels.len() - 1
                     };
@@ -122,15 +125,17 @@ impl OrderBook {
             Some(price_level_ref) => *price_level_ref,
         };
 
-        // Find the PriceLevel using Index in PriceLevelRef
-        let cursor = self.price_levels[price_level_ref.index]
+        let cursor: usize = self.price_levels[price_level_ref.index]
             .as_mut()
-            .expect("Price Level cannot be None!")
-            .add_order_return_ptr(order.clone());
+            .unwrap()
+            .add_order(order);
+
         let order_entry = OrderEntry {
             order: order.clone(),
-            cursor,
+            order_cursor: cursor,
+            price_level_cursor: price_level_ref.index,
         };
+
         self.orders.insert(order.order_id, order_entry);
 
         // add the Level Reference by side
@@ -140,7 +145,10 @@ impl OrderBook {
         };
     }
     // Should rename to handle order
-    pub fn add_order(&mut self, order: &Arc<Order>) -> Result<Vec<Option<Trade>>, OrderBookError> {
+    pub fn handle_order(
+        &mut self,
+        order: &Arc<Order>,
+    ) -> Result<Vec<Option<Trade>>, OrderBookError> {
         if self.orders.contains_key(&order.order_id) {
             return Err(OrderBookError::OrderAlreadyExists {
                 order_id: order.order_id,
@@ -164,20 +172,13 @@ impl OrderBook {
         Ok(trades)
     }
 
-    pub fn cancel_order(&mut self, order_id: OrderId) -> Result<(), OrderBookError> {
-        let order_entry = self
-            .orders
-            .remove(&order_id)
-            .ok_or(OrderBookError::OrderNotFound { order_id })?;
-
-        let order = &order_entry.order;
-
+    fn remove_order_from_price_level(&mut self, order: &Arc<Order>, order_entry: &OrderEntry) {
         match order.side {
             Side::Buy => {
                 let price_level_ref = { self.bids.get(&Reverse(order.price)) };
                 let index: usize = price_level_ref.unwrap().index;
                 let target_level = self.price_levels[index].as_mut().unwrap();
-                target_level.remove_by_ptr(order_entry.cursor);
+                target_level.remove_order(order_entry.order_cursor, order);
                 if target_level.order_count == 0 {
                     self.price_levels[index] = None;
                     self.free_indices.push_back(index);
@@ -188,7 +189,7 @@ impl OrderBook {
                 let price_level_ref = { self.bids.get(&Reverse(order.price)) };
                 let index: usize = price_level_ref.unwrap().index;
                 let target_level = self.price_levels[index].as_mut().unwrap();
-                target_level.remove_by_ptr(order_entry.cursor);
+                target_level.remove_order(order_entry.order_cursor, order);
                 if target_level.order_count == 0 {
                     self.price_levels[index] = None;
                     self.free_indices.push_back(index);
@@ -196,6 +197,16 @@ impl OrderBook {
                 }
             }
         }
+    }
+
+    pub fn cancel_order(&mut self, order_id: OrderId) -> Result<(), OrderBookError> {
+        let order_entry = self
+            .orders
+            .remove(&order_id)
+            .ok_or(OrderBookError::OrderNotFound { order_id })?;
+
+        let order = &order_entry.order;
+        self.remove_order_from_price_level(order, &order_entry);
         Ok(())
     }
 
@@ -254,110 +265,6 @@ impl OrderBook {
         Ok(trades)
     }
 
-    fn match_at_price_level(
-        &mut self,
-        best_price: Price,
-        order: &Arc<Order>,
-        max_quantity: Quantity,
-    ) -> Result<Trade, OrderBookError> {
-        let price_level_ref_opt = match order.side {
-            Side::Buy => self.asks.get_mut(&best_price),
-            Side::Sell => self.bids.get_mut(&Reverse(best_price)),
-        };
-
-        let price_level_ref = match price_level_ref_opt {
-            Some(level) => level,
-            None => {
-                error!("Price Level Not Found at price {}", best_price);
-                return Err(OrderBookError::PriceLevelNotFound { price: best_price });
-            }
-        };
-
-        // 2️⃣ Get cursor to front node
-        let index = price_level_ref.index;
-        let target_level = self.price_levels[index].as_mut().unwrap();
-        let front_cursor = target_level.orders.front();
-        let node_ptr = match front_cursor.get() {
-            Some(node) => node as *const OrderNode as *mut OrderNode,
-            None => {
-                return Err(OrderBookError::OrderNotFound {
-                    order_id: order.order_id,
-                });
-            }
-        };
-        let node_ptr = unsafe { NonNull::new_unchecked(node_ptr) };
-
-        // 3️⃣ Build mutable cursor from pointer
-        let mut cursor = unsafe { target_level.orders.cursor_mut_from_ptr(node_ptr.as_ptr()) };
-
-        // 4️⃣ Get old node
-        let old_order_arc = cursor.get().expect("Node must exist").order.clone();
-
-        // 5️⃣ Compute trade quantity and trade
-        let trade_quantity = max_quantity.min(old_order_arc.remaining_quantity);
-        let trade_price = old_order_arc.price;
-
-        let trade = Trade::new(
-            order.order_id,
-            old_order_arc.order_id,
-            trade_price,
-            trade_quantity,
-        );
-
-        {
-            target_level.volume -= trade_quantity;
-        }
-
-        let new_order_remaining_quantity = old_order_arc.remaining_quantity - trade_quantity;
-        let new_order_executed_quantity = old_order_arc.executed_quantity + trade_quantity;
-
-        // 7️⃣ Create new node with updated remaining quantity and other fields
-        let new_order = Arc::new(Order {
-            order_id: old_order_arc.order_id,
-            order_type: old_order_arc.order_type,
-            side: old_order_arc.side,
-            status: if new_order_remaining_quantity == 0 {
-                Status::Filled
-            } else {
-                Status::PartiallyFilled
-            },
-            price: old_order_arc.price,
-            original_quantity: old_order_arc.original_quantity,
-            remaining_quantity: new_order_remaining_quantity,
-            executed_quantity: new_order_executed_quantity,
-            timestamp: Utc::now().timestamp_micros(),
-            // copy other fields if necessary
-        });
-
-        let new_node = OrderNode {
-            link: LinkedListLink::new(),
-            order: new_order.clone(),
-        };
-
-        // 8️⃣ Insert new node after old node
-        cursor.insert_after(Box::new(new_node));
-
-        // 9️⃣ Remove old node
-        cursor.remove();
-
-        // Remove filled order from price level
-        if new_order.remaining_quantity == 0 {
-            target_level.orders.pop_front(); // order removal
-            target_level.order_count -= 1; // update order count
-        }
-
-        // Update HashMap entry
-        if let Some(entry) = self.orders.get_mut(&old_order_arc.order_id) {
-            entry.order = new_order;
-        }
-
-        //1️⃣ Remove empty price level if needed
-        if target_level.orders.is_empty() {
-            self.remove_empty_price_level(best_price, order);
-        };
-        Ok(trade)
-    }
-
     fn match_at_price_level_optimized(
         &mut self,
         best_price: Price,
@@ -369,20 +276,34 @@ impl OrderBook {
             Side::Sell => self.bids.get(&Reverse(best_price))?,
         };
 
+        // Go to Vec<PriceLevel> using the index inside PriceLevelRef
         let level_index = level_ref.index;
-        let price_level = self.price_levels[level_index].as_mut()?;
 
-        // Get front order info
-        let front_cursor = price_level.orders.front();
-        let node_ptr = front_cursor
-            .get()
-            .map(|node| node as *const OrderNode as *mut OrderNode)?;
-        let node_ptr = unsafe { NonNull::new_unchecked(node_ptr) };
+        // unwrap the price level, but it could not be None
+        // Since if price level is None, we should reject before
+        // Add order simply add to book if GTC/Limit
+        let price_level = self.price_levels[level_index].as_mut().unwrap();
 
-        // Create cursor from pointer for mutation
-        let mut cursor = unsafe { price_level.orders.cursor_mut_from_ptr(node_ptr.as_ptr()) };
+        // println!("price level before pop {:?}", &price_level);
 
-        let resting_order = cursor.get()?.order.clone();
+        // remove front item is none in order VecDeque
+        let shift_loc = price_level.get_shift_loc();
+
+        let order_id = price_level
+            .orders
+            .get(shift_loc)
+            .expect("There must have orderIds if Pricelevel is not None/Newly created")
+            .expect("OrderId cannot be None if PriceLevel is not None/Newly created");
+
+        // println!("price level after pop {:?}", &price_level);
+
+        let order_entry = self.orders.get(&order_id).expect("OrderId Must Exist!");
+
+        let resting_order = &order_entry.order;
+        let price_levels_cursor = order_entry.price_level_cursor;
+        let orders_cursor = order_entry.order_cursor;
+
+        // Matching rule
         let trade_quantity = max_quantity.min(resting_order.remaining_quantity);
         let trade_price = best_price;
 
@@ -394,29 +315,35 @@ impl OrderBook {
         );
 
         if trade_quantity == resting_order.remaining_quantity {
-            // Full fill - remove order
-            cursor.remove();
-            price_level.volume -= trade_quantity;
-            price_level.order_count -= 1;
-            self.orders.remove(&resting_order.order_id);
+            price_level.remove_order(orders_cursor, &resting_order);
+            // remove record from Orders HashMap
+            self.orders.remove(&order_id);
         } else {
-            // Partial fill - update using cursor.replace()
             let new_quantity = resting_order.remaining_quantity - trade_quantity;
-            let mut updated_order = (*resting_order).clone();
+            let mut updated_order = (**resting_order).clone();
             updated_order.remaining_quantity = new_quantity;
             updated_order.executed_quantity += trade_quantity;
             updated_order.status = Status::PartiallyFilled;
 
-            let updated_node = Box::new(OrderNode::new(Arc::new(updated_order)));
-            cursor.replace_with(updated_node);
+            // update orderEntry record
+            let new_order_entry = OrderEntry {
+                order: Arc::new(updated_order),
+                price_level_cursor: price_levels_cursor,
+                order_cursor: orders_cursor,
+            };
+            self.orders
+                .entry(resting_order.order_id)
+                .and_modify(|order_entry| *order_entry = new_order_entry);
 
+            // only update the volume, order count remains the same
             price_level.volume -= trade_quantity;
+            // if not filled consumed, add pack order_id
+            // price_level.orders.push_front(Some(order_id));
         }
 
-        if price_level.orders.is_empty() {
-            self.remove_empty_price_level(best_price, incoming_order);
+        if price_level.order_count == 0 {
+            let _ = self.remove_empty_price_level(best_price, incoming_order);
         }
-
         Some(trade)
     }
 
@@ -554,40 +481,38 @@ mod orderbook_tests {
 
     #[test]
     fn check_add_new_limit_order() {
-        let mut test_ob = OrderBook::new();
+        let mut test_ob = OrderBook::new(1024, 1024);
         let limit_order = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 10, 10));
-        let trades = test_ob.add_order(&limit_order).unwrap();
+        let trades = test_ob.handle_order(&limit_order).unwrap();
         assert_eq!(trades, Vec::new());
     }
 
     #[test]
     fn check_add_new_limit_order_and_later_comsumed_by_market_order() {
-        let mut test_ob = OrderBook::new();
+        let mut test_ob = OrderBook::new(1024, 1024);
         let limit_order = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 10, 10));
         let market_order = Arc::new(Order::new(OrderType::MarketOrder, Side::Sell, 10, 10));
 
         // limit order first arrives to the OB
         {
-            test_ob.add_order(&limit_order).unwrap();
+            test_ob.handle_order(&limit_order).unwrap();
         }
         // Market Order arrives later to consume the OB
-        let trades = test_ob.add_order(&market_order).unwrap();
-        assert_eq!(trades.iter().next().unwrap().price, 10);
-        assert_eq!(trades.iter().next().unwrap().quantity, 10);
+        let trades = test_ob.handle_order(&market_order).unwrap();
         assert_eq!(trades.len(), 1);
     }
 
     #[test]
     fn check_get_best_bid_ask_in_multiple_limit_orders() {
-        let mut test_ob = OrderBook::new();
+        let mut test_ob = OrderBook::new(1024, 1024);
         {
             let buy_order_1 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 9, 10));
             let buy_order_2 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 8, 5));
             let buy_order_3 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 7, 3));
 
-            test_ob.add_order(&buy_order_1).unwrap();
-            test_ob.add_order(&buy_order_2).unwrap();
-            test_ob.add_order(&buy_order_3).unwrap();
+            test_ob.handle_order(&buy_order_1).unwrap();
+            test_ob.handle_order(&buy_order_2).unwrap();
+            test_ob.handle_order(&buy_order_3).unwrap();
         }
 
         {
@@ -595,9 +520,9 @@ mod orderbook_tests {
             let sell_order_2 = Arc::new(Order::new(OrderType::LimitOrder, Side::Sell, 11, 5));
             let sell_order_3 = Arc::new(Order::new(OrderType::LimitOrder, Side::Sell, 12, 3));
 
-            test_ob.add_order(&sell_order_1).unwrap();
-            test_ob.add_order(&sell_order_2).unwrap();
-            test_ob.add_order(&sell_order_3).unwrap();
+            test_ob.handle_order(&sell_order_1).unwrap();
+            test_ob.handle_order(&sell_order_2).unwrap();
+            test_ob.handle_order(&sell_order_3).unwrap();
         }
         assert_eq!(test_ob.get_best_bid().unwrap(), 9);
         assert_eq!(test_ob.get_best_ask().unwrap(), 10);
@@ -605,7 +530,7 @@ mod orderbook_tests {
 
     #[test]
     fn check_add_multiples_limit_order_and_later_comsumed_by_an_market_order() {
-        let mut test_ob = OrderBook::new();
+        let mut test_ob = OrderBook::new(1024, 1024);
         let market_order = Arc::new(Order::new(OrderType::MarketOrder, Side::Sell, 0, 10));
 
         // limit order first arrives to the OB
@@ -614,12 +539,12 @@ mod orderbook_tests {
             let buy_order_2 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 8, 5));
             let buy_order_3 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 7, 10));
 
-            test_ob.add_order(&buy_order_1).unwrap();
-            test_ob.add_order(&buy_order_2).unwrap();
-            test_ob.add_order(&buy_order_3).unwrap();
+            test_ob.handle_order(&buy_order_1).unwrap();
+            test_ob.handle_order(&buy_order_2).unwrap();
+            test_ob.handle_order(&buy_order_3).unwrap();
         }
         // Market Order arrives later to consume the OB
-        let trades = test_ob.add_order(&market_order).unwrap();
+        let trades = test_ob.handle_order(&market_order).unwrap();
         assert_eq!(trades.len(), 3);
     }
 

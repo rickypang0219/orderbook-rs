@@ -26,7 +26,7 @@ fn format_number(n: u64) -> String {
 }
 
 fn benchmark_add_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new();
+    let mut orderbook = OrderBook::new(1024, 1024);
 
     // Set up random number generator
     let mut rng = thread_rng();
@@ -50,7 +50,7 @@ fn benchmark_add_orders(num_orders: u64) {
             price_dist.sample(&mut rng), // Random price
             qty_dist.sample(&mut rng),   // Random quantity
         ));
-        orderbook.add_order(&order).unwrap(); // Adjust error handling as needed
+        orderbook.handle_order(&order).unwrap(); // Adjust error handling as needed
     }
 
     let duration = start.elapsed();
@@ -71,13 +71,13 @@ fn benchmark_add_orders(num_orders: u64) {
 }
 
 fn benchmark_cancel_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new();
+    let mut orderbook = OrderBook::new(1024, 1024);
     let mut order_ids: Vec<Uuid> = Vec::with_capacity(num_orders as usize);
 
     // Add orders to the book
     for _i in 0..num_orders {
         let order = Arc::new(Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10));
-        orderbook.add_order(&order).unwrap();
+        orderbook.handle_order(&order).unwrap();
         order_ids.push(order.order_id);
     }
 
@@ -108,7 +108,7 @@ fn benchmark_cancel_orders(num_orders: u64) {
 }
 
 fn benchmark_match_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new();
+    let mut orderbook = OrderBook::new(1024, 1024);
 
     // Set up random number generator for quantities
     let mut rng = thread_rng();
@@ -122,7 +122,7 @@ fn benchmark_match_orders(num_orders: u64) {
             100,                       // Fixed price
             qty_dist.sample(&mut rng), // Random quantity
         ));
-        orderbook.add_order(&order).unwrap(); // Assume no matching for buy orders
+        orderbook.handle_order(&order).unwrap(); // Assume no matching for buy orders
     }
 
     let mut trades_executed: u64 = 0;
@@ -136,7 +136,7 @@ fn benchmark_match_orders(num_orders: u64) {
             100,                       // Fixed price to match buy orders
             qty_dist.sample(&mut rng), // Random quantity
         ));
-        let trades = orderbook.add_order(&order).unwrap();
+        let trades = orderbook.handle_order(&order).unwrap();
         trades_executed += trades.len() as u64; // Count number of trades
     }
 
@@ -170,7 +170,7 @@ fn benchmark_match_orders(num_orders: u64) {
 }
 
 fn main() {
-    let num_orders: u64 = 1_000;
+    let num_orders: u64 = 10_000;
 
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
