@@ -26,11 +26,12 @@ fn format_number(n: u64) -> String {
 }
 
 fn benchmark_add_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new(1024, 1024);
+    let mut orderbook = OrderBook::new(4096, 4096);
 
     // Set up random number generator
     let mut rng = thread_rng();
-    let price_dist = Uniform::new_inclusive(90, 110); // Price range [90, 110]
+    let price_dist_bid = Uniform::new_inclusive(90, 110); // Price range [90, 110]
+    let price_dist_ask = Uniform::new_inclusive(111, 120);
     let qty_dist = Uniform::new_inclusive(1, 100); // Quantity range [1, 100]
     let side_dist = Uniform::new_inclusive(0, 1); // Side: 0 (Sell) or 1 (Buy)
 
@@ -43,6 +44,11 @@ fn benchmark_add_orders(num_orders: u64) {
             Side::Buy
         } else {
             Side::Sell
+        };
+        let price_dist = if side == Side::Buy {
+            price_dist_bid
+        } else {
+            price_dist_ask
         };
         let order = Arc::new(Order::new(
             OrderType::GoodTillCancel,
@@ -170,7 +176,7 @@ fn benchmark_match_orders(num_orders: u64) {
 }
 
 fn main() {
-    let num_orders: u64 = 10_000;
+    let num_orders: u64 = 100_000;
 
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
