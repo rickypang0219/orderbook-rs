@@ -1,5 +1,4 @@
 use chrono::Utc;
-use std::rc::Rc;
 use uuid::Uuid;
 
 use crate::orderbook::custom_errors::QuantityError;
@@ -41,15 +40,6 @@ pub struct Order {
     pub timestamp: i64,
 }
 
-pub struct ModifyOrder {
-    // order type by default Limit order / GTC
-    order_id: Uuid,
-    price: Price,
-    quantity: Quantity,
-    side: Side,
-    timestamp: i64,
-}
-
 impl Order {
     pub fn new(
         order_type: OrderType,
@@ -57,9 +47,23 @@ impl Order {
         price: Price,
         original_quantity: Quantity,
     ) -> Self {
+        Self::with_id(Uuid::new_v4(), order_type, side, price, original_quantity)
+    }
+
+    /// Constructs an order with a caller-supplied ID.
+    ///
+    /// This is useful for deterministic replay, tests, and benchmarks where UUID
+    /// generation should not be included in the operation being measured.
+    pub fn with_id(
+        order_id: Uuid,
+        order_type: OrderType,
+        side: Side,
+        price: Price,
+        original_quantity: Quantity,
+    ) -> Self {
         Order {
             order_type,
-            order_id: Uuid::new_v4(),
+            order_id,
             side,
             price,
             status: Status::New,
@@ -86,25 +90,8 @@ impl Order {
         }
     }
 
-    pub fn is_filled(self) -> bool {
-        // follow up: modify order state to filled
+    pub fn is_filled(&self) -> bool {
         self.remaining_quantity == 0
-    }
-}
-
-impl ModifyOrder {
-    fn new(order_id: Uuid, price: Price, quantity: Quantity, side: Side) -> Self {
-        let now = Utc::now().timestamp_millis();
-        ModifyOrder {
-            order_id,
-            price,
-            quantity,
-            side,
-            timestamp: now,
-        }
-    }
-    pub fn to_order_ptr(&self, order_type: OrderType) -> Rc<Order> {
-        Rc::new(Order::new(order_type, self.side, self.price, self.quantity))
     }
 }
 
@@ -128,6 +115,6 @@ mod order_tests {
         let _ = test_order.fill_qty(10);
         assert_eq!(test_order.executed_quantity, 10);
         assert_eq!(test_order.remaining_quantity, 0);
-        assert_eq!(test_order.is_filled(), true);
+        assert!(test_order.is_filled());
     }
 }

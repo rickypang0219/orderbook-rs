@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-pub mod orderbook;
-use orderbook::order::{Order, OrderType, Side};
-use orderbook::orderbook_impl::OrderBook;
+use orderbook::orderbook::order::{Order, OrderType, Side};
+use orderbook::orderbook::orderbook_impl::OrderBook;
 
 fn main() {
     env_logger::Builder::new()

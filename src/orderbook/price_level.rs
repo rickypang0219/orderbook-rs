@@ -1,12 +1,11 @@
-use std::boxed::Box;
-use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::orderbook::order::{Order, Status};
 use crate::orderbook::types::{OrderId, Price, Quantity};
 
 use intrusive_collections::linked_list::CursorMut;
-use intrusive_collections::{intrusive_adapter, KeyAdapter, LinkedList, LinkedListLink};
+use intrusive_collections::{KeyAdapter, LinkedList, LinkedListLink, intrusive_adapter};
 
 #[derive(Debug)]
 pub struct OrderNode {
@@ -29,8 +28,8 @@ pub struct LevelInfo {
 }
 
 pub struct OrderEntry {
-    pub order: Arc<Order>,
-    pub cursor: NonNull<OrderNode>, // pub cursor: CursorMut<'a, OrderNodeAdapter>,
+    /// Keeps the node alive while it is addressable through the order index.
+    pub node: Rc<OrderNode>,
 }
 
 impl OrderNode {
@@ -44,7 +43,7 @@ impl OrderNode {
 
 // Register adapter
 intrusive_adapter!(
-    pub OrderNodeAdapter = Box<OrderNode>: OrderNode { link: LinkedListLink }
+    pub OrderNodeAdapter = Rc<OrderNode>: OrderNode { link: LinkedListLink }
 );
 
 // Implement KeyAdapter
@@ -68,14 +67,12 @@ impl PriceLevel {
 
     /// Add an order to the back of the list
     pub fn add_order(&mut self, order: Arc<Order>) -> CursorMut<'_, OrderNodeAdapter> {
-        let node = Box::new(OrderNode::new(order.clone()));
+        let node = Rc::new(OrderNode::new(order.clone()));
         self.volume += order.remaining_quantity;
         self.order_count += 1;
         self.orders.push_back(node);
 
-        // Return a cursor pointing to the new back element
-        let cursor = self.orders.cursor_mut();
-        cursor
+        self.orders.cursor_mut()
     }
 
     /// Remove an order at the cursor
@@ -86,41 +83,32 @@ impl PriceLevel {
         if let Some(node) = cursor.remove() {
             self.volume -= node.order.remaining_quantity;
             self.order_count -= 1;
-            Some(node.order)
+            Some(node.order.clone())
         } else {
             None
         }
     }
 
-    pub fn add_order_return_ptr(&mut self, order: Arc<Order>) -> NonNull<OrderNode> {
+    pub fn add_order_return_handle(&mut self, order: Arc<Order>) -> Rc<OrderNode> {
         self.volume += order.remaining_quantity;
         self.order_count += 1;
 
-        // Push the Box<OrderNode> into the list (list owns it)
-        self.orders.push_back(Box::new(OrderNode::new(order)));
-
-        // Now get a pointer to the back element we just pushed
-        // Safety: back().get() returns Some(&OrderNode) because we just pushed
-        let ptr = self
-            .orders
-            .back()
-            .get()
-            .expect("just pushed, so back exists") as *const OrderNode
-            as *mut OrderNode;
-        // Create NonNull (safe because pointer is non-null)
-        // cast to NonNull; no check - we know it's non-null
-        unsafe { NonNull::new_unchecked(ptr) }
+        let node = Rc::new(OrderNode::new(order));
+        self.orders.push_back(node.clone());
+        node
     }
 
-    /// Remove by node pointer (returns Arc<Order> if removed)
-    pub fn remove_by_ptr(&mut self, ptr: NonNull<OrderNode>) -> Option<Arc<Order>> {
-        // Create cursor mut from ptr — this method consumes &mut self (the list).
-        // Safety: ptr must point to a node that is currently in this list.
-        let mut cursor = unsafe { self.orders.cursor_mut_from_ptr(ptr.as_ptr()) };
+    /// Removes the node referenced by an indexed owning handle.
+    pub fn remove_by_handle(&mut self, node: &Rc<OrderNode>) -> Option<Arc<Order>> {
+        // SAFETY: OrderBook creates the indexed Rc at the same time it inserts a
+        // clone into this list, updates both together on replacement, and calls
+        // this method before the indexed handle is dropped. Therefore `node`
+        // points to a live member of this exact list.
+        let mut cursor = unsafe { self.orders.cursor_mut_from_ptr(Rc::as_ptr(node)) };
         if let Some(node) = cursor.remove() {
             self.volume -= node.order.remaining_quantity;
             self.order_count -= 1;
-            Some(node.order)
+            Some(node.order.clone())
         } else {
             None
         }
@@ -136,7 +124,7 @@ impl PriceLevel {
         if let Some(node) = self.orders.pop_front() {
             self.volume -= node.order.remaining_quantity;
             self.order_count -= 1;
-            Some(node.order)
+            Some(node.order.clone())
         } else {
             None
         }
@@ -158,7 +146,7 @@ impl PriceLevel {
             let new_arc = Arc::new(new_order);
 
             // Insert new node at the same place
-            let new_node = Box::new(OrderNode::new(new_arc.clone()));
+            let new_node = Rc::new(OrderNode::new(new_arc.clone()));
             cursor.insert_before(new_node);
 
             Some(new_arc)
@@ -192,7 +180,7 @@ impl PriceLevel {
             };
 
             // Replace the node using cursor.replace()
-            let updated_node = Box::new(OrderNode::new(Arc::new(updated_order)));
+            let updated_node = Rc::new(OrderNode::new(Arc::new(updated_order)));
             let _ = cursor.replace_with(updated_node);
 
             // Update price level volume
