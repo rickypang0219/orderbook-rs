@@ -1,9 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub mod orderbook;
-use orderbook::order::{NewOrder, Side};
-use orderbook::orderbook_impl::{OrderBook, TradeBuf};
-use orderbook::types::ClientOrderId;
+use orderbook::{ClientOrderId, NewOrder, OrderBook, Side, TradeBuf};
 
 fn now_ns() -> i64 {
     SystemTime::now()
@@ -13,22 +10,33 @@ fn now_ns() -> i64 {
 }
 
 fn main() {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .init();
-
-    // 所有 allocation 喺呢兩行發生，之後 hot path 唔會再掂 malloc
+    // 所有 allocation 喺呢三行發生
     let mut book = OrderBook::new();
+    let report = book.warm_up();
     let mut trades = TradeBuf::default();
+    println!("warm-up: {report:?}");
 
-    let maker = NewOrder::limit(ClientOrderId(1), Side::Buy, 10, 10);
     trades.clear();
-    let maker_id = book.submit(&maker, &mut trades, now_ns()).unwrap();
-    println!("resting order {maker_id}, trades: {:?}", trades.as_slice());
+    let maker_id = book
+        .submit(
+            &NewOrder::limit(ClientOrderId(1), Side::Buy, 10, 10),
+            &mut trades,
+            now_ns(),
+        )
+        .unwrap();
+    println!("resting order {maker_id}");
 
-    let taker = NewOrder::market(ClientOrderId(2), Side::Sell, 4);
     trades.clear();
-    book.submit(&taker, &mut trades, now_ns()).unwrap();
+    book.submit(
+        &NewOrder::market(ClientOrderId(2), Side::Sell, 4),
+        &mut trades,
+        now_ns(),
+    )
+    .unwrap();
     println!("trades: {:?}", trades.as_slice());
-    println!("resting remaining: {:?}", book.get(maker_id).map(|s| s.remaining_qty));
+    println!(
+        "resting remaining: {:?}",
+        book.get(maker_id).map(|s| s.remaining_qty)
+    );
+    println!("best bid: {:?}", book.get_best_bid());
 }

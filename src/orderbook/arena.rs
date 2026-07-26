@@ -17,8 +17,18 @@ use crate::orderbook::types::{ClientOrderId, OrderId, Price, Quantity, NIL};
 /// 原本兩個都存住反而係 state 唔一致嘅來源。
 /// 冇 `timestamp` —— FIFO priority 用 `seq`（單調 counter），
 /// wall clock 會被 NTP 拉倒退，唔可以用嚟排優先次序。
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
+/// 冇 explicit padding field —— `repr(C)` 會自己補尾部 padding。
+/// 冇 padding field 就冇「比較 padding bytes」呢個問題，
+/// `PartialEq` 先至 derive 得心安理得。
+///
+/// `align(64)` 唔係為咗防 false sharing（engine 係單線程，冇並發寫者，
+/// 所以唔需要 `crossbeam_utils::CachePadded` —— 佢喺 x86_64/aarch64 仲要
+/// 撐到 128 bytes，只會令密度差一倍）。佢係為咗保證**冇 slot 跨兩條 line**：
+/// `size_of == 64` 本身唔保證每個元素落喺 64-byte 邊界，要 align 先得。
+/// 有咗 align(64)，`Vec` 嘅 backing allocation 亦會跟住 64 對齊，
+/// 成個 arena 就完美鋪砌。
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderSlot {
     /// 每次 free 遞增。舊 `OrderId` 攞返嚟 resolve 會對唔上 -> 安全 reject。
     pub generation: u32,
@@ -40,7 +50,6 @@ pub struct OrderSlot {
     pub order_type: OrderType,
     pub status: Status,
     pub in_use: bool,
-    _pad: [u8; 4],
 }
 
 impl OrderSlot {
@@ -58,12 +67,10 @@ impl OrderSlot {
         order_type: OrderType::LimitOrder,
         status: Status::New,
         in_use: false,
-        _pad: [0; 4],
     };
 
     /// 由一張新單起一個 slot。
     ///
-    /// 提供呢個 constructor 係因為 `_pad` 係私有 field —— 其他 module
     /// 用 `..OrderSlot::EMPTY` 嘅 struct update syntax 會 E0451。
     pub const fn incoming(
         client_order_id: ClientOrderId,
@@ -87,7 +94,6 @@ impl OrderSlot {
             order_type,
             status: Status::New,
             in_use: false,
-            _pad: [0; 4],
         }
     }
 
@@ -219,6 +225,12 @@ impl OrderArena {
         &mut self.slots[idx as usize]
     }
 
+    /// 俾 `mem::warm` 用嚟 pre-fault / mlock 整塊 arena。
+    #[inline]
+    pub fn slots_mut(&mut self) -> &mut [OrderSlot] {
+        &mut self.slots
+    }
+
     #[inline(always)]
     pub fn id_at(&self, idx: u32) -> OrderId {
         OrderId::new(idx, self.slots[idx as usize].generation)
@@ -239,8 +251,19 @@ mod tests {
     }
 
     #[test]
-    fn order_slot_is_one_cache_line() {
+    fn order_slot_is_exactly_one_cache_line() {
         assert_eq!(std::mem::size_of::<OrderSlot>(), 64);
+        // size 啱唔夠 —— 要 align 先保證冇元素跨 line
+        assert_eq!(std::mem::align_of::<OrderSlot>(), 64);
+    }
+
+    #[test]
+    fn every_slot_starts_on_a_cache_line_boundary() {
+        let a = OrderArena::with_capacity(8);
+        for i in 0..8u32 {
+            let addr = a.at(i) as *const OrderSlot as usize;
+            assert_eq!(addr % 64, 0, "slot {i} straddles a cache line");
+        }
     }
 
     #[test]
