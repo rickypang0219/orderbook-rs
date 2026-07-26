@@ -71,23 +71,26 @@ impl Order {
     }
 
     pub fn fill_qty(&mut self, quantity: Quantity) -> Result<(), QuantityError> {
-        if (self.original_quantity - self.executed_quantity) < quantity {
-            Err(QuantityError {
-                message: format!(
-                    "Quantity Error: remaining quantity {} ; fill quantity {}",
-                    (self.original_quantity - self.executed_quantity),
-                    quantity,
-                ),
-            })
-        } else {
-            self.executed_quantity += quantity;
-            self.remaining_quantity = self.original_quantity - self.executed_quantity;
-            Ok(())
+        let remaining = self.original_quantity - self.executed_quantity;
+        if remaining < quantity {
+            // 冇 format!、冇 String —— 純 Copy 型 error
+            return Err(QuantityError::Overfill {
+                remaining,
+                requested: quantity,
+            });
         }
+        self.executed_quantity += quantity;
+        self.remaining_quantity = remaining - quantity;
+        self.status = if self.remaining_quantity == 0 {
+            Status::Filled
+        } else {
+            Status::PartiallyFilled
+        };
+        Ok(())
     }
 
-    pub fn is_filled(self) -> bool {
-        // follow up: modify order state to filled
+    /// 借用 self，唔再 consume 佢
+    pub fn is_filled(&self) -> bool {
         self.remaining_quantity == 0
     }
 }

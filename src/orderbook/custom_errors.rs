@@ -1,15 +1,12 @@
-use std::error::Error;
-use std::fmt;
+use crate::orderbook::types::Quantity;
 
-#[derive(Debug)]
-pub struct QuantityError {
-    pub message: String,
+/// Copy 型 error：冇 String，冇 format!，冇 heap allocation。
+/// 人類可讀嘅訊息交由 Display 喺 log/journal 邊界先 format。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum QuantityError {
+    #[error("fill quantity {requested} exceeds remaining {remaining}")]
+    Overfill {
+        remaining: Quantity,
+        requested: Quantity,
+    },
 }
-
-impl fmt::Display for QuantityError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Value error: {}", self.message)
-    }
-}
-
-impl Error for QuantityError {}

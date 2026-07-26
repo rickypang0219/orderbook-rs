@@ -7,10 +7,14 @@ use rand::distributions::Uniform;
 use rand::prelude::*;
 use uuid::Uuid;
 
+pub mod alloc_guard;
 pub mod orderbook;
 
+#[global_allocator]
+static ALLOC: alloc_guard::Counting = alloc_guard::Counting;
+
 use orderbook::order::{Order, OrderType, Side};
-use orderbook::orderbook_impl::OrderBook;
+use orderbook::orderbook_impl::{OrderBook, TradeBuf};
 
 fn format_number(n: u64) -> String {
     let s = n.to_string();
@@ -27,6 +31,7 @@ fn format_number(n: u64) -> String {
 
 fn benchmark_add_orders(num_orders: u64) {
     let mut orderbook = OrderBook::new();
+    let mut trades = TradeBuf::default();
 
     // Set up random number generator
     let mut rng = thread_rng();
@@ -35,6 +40,7 @@ fn benchmark_add_orders(num_orders: u64) {
     let side_dist = Uniform::new_inclusive(0, 1); // Side: 0 (Sell) or 1 (Buy)
 
     // Measure time for adding orders
+    alloc_guard::arm();
     let start = Instant::now();
 
     // Add random orders to the book
@@ -50,10 +56,12 @@ fn benchmark_add_orders(num_orders: u64) {
             price_dist.sample(&mut rng), // Random price
             qty_dist.sample(&mut rng),   // Random quantity
         ));
-        orderbook.add_order(&order).unwrap(); // Adjust error handling as needed
+        trades.clear();
+        orderbook.add_order(&order, &mut trades).unwrap();
     }
 
     let duration = start.elapsed();
+    let (allocs, bytes) = alloc_guard::disarm();
 
     let seconds = duration.as_secs_f64();
     let orders_per_sec = if seconds > 0.0 {
@@ -67,17 +75,25 @@ fn benchmark_add_orders(num_orders: u64) {
     println!("Add {} orders:", format_number(num_orders));
     println!("  Time: {:.2} ms", duration.as_micros() as f64 / 1000.0);
     println!("  Throughput: {} orders/sec", format_number(orders_per_sec));
-    println!("  Latency: {:.3} μs/order\n", latency_us);
+    println!("  Latency: {:.3} μs/order", latency_us);
+    println!(
+        "  Allocations: {} ({:.2} per order, {} bytes)\n",
+        format_number(allocs),
+        allocs as f64 / num_orders as f64,
+        format_number(bytes)
+    );
 }
 
 fn benchmark_cancel_orders(num_orders: u64) {
     let mut orderbook = OrderBook::new();
+    let mut trades = TradeBuf::default();
     let mut order_ids: Vec<Uuid> = Vec::with_capacity(num_orders as usize);
 
     // Add orders to the book
     for _i in 0..num_orders {
         let order = Arc::new(Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10));
-        orderbook.add_order(&order).unwrap();
+        trades.clear();
+        orderbook.add_order(&order, &mut trades).unwrap();
         order_ids.push(order.order_id);
     }
 
@@ -109,6 +125,7 @@ fn benchmark_cancel_orders(num_orders: u64) {
 
 fn benchmark_match_orders(num_orders: u64) {
     let mut orderbook = OrderBook::new();
+    let mut trades = TradeBuf::default();
 
     // Set up random number generator for quantities
     let mut rng = thread_rng();
@@ -122,7 +139,8 @@ fn benchmark_match_orders(num_orders: u64) {
             100,                       // Fixed price
             qty_dist.sample(&mut rng), // Random quantity
         ));
-        orderbook.add_order(&order).unwrap(); // Assume no matching for buy orders
+        trades.clear();
+        orderbook.add_order(&order, &mut trades).unwrap();
     }
 
     let mut trades_executed: u64 = 0;
@@ -136,8 +154,9 @@ fn benchmark_match_orders(num_orders: u64) {
             100,                       // Fixed price to match buy orders
             qty_dist.sample(&mut rng), // Random quantity
         ));
-        let trades = orderbook.add_order(&order).unwrap();
-        trades_executed += trades.len() as u64; // Count number of trades
+        trades.clear();
+        orderbook.add_order(&order, &mut trades).unwrap();
+        trades_executed += trades.len() as u64;
     }
 
     let duration = start.elapsed();

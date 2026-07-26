@@ -1,11 +1,9 @@
-use std::boxed::Box;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::orderbook::order::{Order, Status};
+use crate::orderbook::order::Order;
 use crate::orderbook::types::{OrderId, Price, Quantity};
 
-use intrusive_collections::linked_list::CursorMut;
 use intrusive_collections::{intrusive_adapter, KeyAdapter, LinkedList, LinkedListLink};
 
 #[derive(Debug)]
@@ -66,32 +64,6 @@ impl PriceLevel {
         }
     }
 
-    /// Add an order to the back of the list
-    pub fn add_order(&mut self, order: Arc<Order>) -> CursorMut<'_, OrderNodeAdapter> {
-        let node = Box::new(OrderNode::new(order.clone()));
-        self.volume += order.remaining_quantity;
-        self.order_count += 1;
-        self.orders.push_back(node);
-
-        // Return a cursor pointing to the new back element
-        let cursor = self.orders.cursor_mut();
-        cursor
-    }
-
-    /// Remove an order at the cursor
-    pub fn remove_order(
-        &mut self,
-        mut cursor: CursorMut<'_, OrderNodeAdapter>,
-    ) -> Option<Arc<Order>> {
-        if let Some(node) = cursor.remove() {
-            self.volume -= node.order.remaining_quantity;
-            self.order_count -= 1;
-            Some(node.order)
-        } else {
-            None
-        }
-    }
-
     pub fn add_order_return_ptr(&mut self, order: Arc<Order>) -> NonNull<OrderNode> {
         self.volume += order.remaining_quantity;
         self.order_count += 1;
@@ -142,31 +114,6 @@ impl PriceLevel {
         }
     }
 
-    pub fn update_order(
-        &mut self,
-        mut cursor: CursorMut<'_, OrderNodeAdapter>,
-        new_quantity: Quantity,
-    ) -> Option<Arc<Order>> {
-        if let Some(old_node) = cursor.remove() {
-            // Calculate delta
-            let old_quantity = old_node.order.remaining_quantity;
-            self.volume = self.volume - old_quantity + new_quantity;
-
-            // Create updated order
-            let mut new_order = (*old_node.order).clone();
-            new_order.remaining_quantity = new_quantity;
-            let new_arc = Arc::new(new_order);
-
-            // Insert new node at the same place
-            let new_node = Box::new(OrderNode::new(new_arc.clone()));
-            cursor.insert_before(new_node);
-
-            Some(new_arc)
-        } else {
-            None
-        }
-    }
-
     pub fn get_level_info(&self) -> LevelInfo {
         LevelInfo {
             price: self.price,
@@ -174,33 +121,4 @@ impl PriceLevel {
         }
     }
 
-    pub fn update_front_order_quantity(&mut self, new_quantity: Quantity) -> Option<Quantity> {
-        let mut cursor = self.orders.front_mut();
-
-        if let Some(front_node) = cursor.get() {
-            let old_quantity = front_node.order.remaining_quantity;
-            let delta = old_quantity as i64 - new_quantity as i64;
-
-            // Create updated order
-            let mut updated_order = (*front_node.order).clone();
-            updated_order.remaining_quantity = new_quantity;
-            updated_order.executed_quantity += delta.max(0) as Quantity;
-            updated_order.status = if new_quantity == 0 {
-                Status::Filled
-            } else {
-                Status::PartiallyFilled
-            };
-
-            // Replace the node using cursor.replace()
-            let updated_node = Box::new(OrderNode::new(Arc::new(updated_order)));
-            let _ = cursor.replace_with(updated_node);
-
-            // Update price level volume
-            self.volume = self.volume.saturating_sub(delta.unsigned_abs());
-
-            Some(old_quantity)
-        } else {
-            None
-        }
-    }
 }
