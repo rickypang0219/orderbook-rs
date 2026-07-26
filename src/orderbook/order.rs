@@ -1,11 +1,7 @@
-use chrono::Utc;
-use std::rc::Rc;
-use uuid::Uuid;
+use crate::orderbook::types::{ClientOrderId, Price, Quantity};
 
-use crate::orderbook::custom_errors::QuantityError;
-use crate::orderbook::types::{Price, Quantity};
-
-#[derive(PartialEq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u8)]
 pub enum OrderType {
     LimitOrder,
     MarketOrder,
@@ -14,13 +10,40 @@ pub enum OrderType {
     GoodTillCancel,
 }
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+impl OrderType {
+    /// 未食完嘅餘數會唔會掛落 book？
+    /// Market / IOC / FOK 都唔會 —— 原本 code 冇統一表達呢個概念，
+    /// IOC 就係咁樣變成一個 `=> {}` 嘅空 arm。
+    #[inline(always)]
+    pub const fn rests_on_book(self) -> bool {
+        matches!(self, OrderType::LimitOrder | OrderType::GoodTillCancel)
+    }
+
+    #[inline(always)]
+    pub const fn is_market(self) -> bool {
+        matches!(self, OrderType::MarketOrder)
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u8)]
 pub enum Side {
     Buy,
     Sell,
 }
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+impl Side {
+    #[inline(always)]
+    pub const fn opposite(self) -> Side {
+        match self {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u8)]
 pub enum Status {
     New,
     PartiallyFilled,
@@ -28,109 +51,43 @@ pub enum Status {
     Canceled,
 }
 
-#[derive(Debug, Clone)]
-pub struct Order {
+/// 由外面入嚟嘅新單請求。
+///
+/// **冇 `order_id` field** —— 呢個係整個重構嘅語義核心。
+/// Client 提供 `ClientOrderId`；`OrderId` 由 engine accept 之後先分配並返回。
+/// 原本 `Order::new()` 自己 `Uuid::new_v4()` 出嚟嗰個 ID 兩者都唔係。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewOrder {
+    pub client_order_id: ClientOrderId,
     pub order_type: OrderType,
-    pub order_id: Uuid, // use uuid to replace u64
     pub side: Side,
     pub price: Price,
-    pub status: Status,
-    pub original_quantity: Quantity,
-    pub executed_quantity: Quantity,
-    pub remaining_quantity: Quantity,
-    pub timestamp: i64,
+    pub quantity: Quantity,
 }
 
-pub struct ModifyOrder {
-    // order type by default Limit order / GTC
-    order_id: Uuid,
-    price: Price,
-    quantity: Quantity,
-    side: Side,
-    timestamp: i64,
-}
-
-impl Order {
-    pub fn new(
-        order_type: OrderType,
+impl NewOrder {
+    pub const fn limit(
+        client_order_id: ClientOrderId,
         side: Side,
         price: Price,
-        original_quantity: Quantity,
+        quantity: Quantity,
     ) -> Self {
-        Order {
-            order_type,
-            order_id: Uuid::new_v4(),
+        NewOrder {
+            client_order_id,
+            order_type: OrderType::LimitOrder,
             side,
-            price,
-            status: Status::New,
-            original_quantity,
-            executed_quantity: 0,
-            remaining_quantity: original_quantity,
-            timestamp: Utc::now().timestamp_millis(),
-        }
-    }
-
-    pub fn fill_qty(&mut self, quantity: Quantity) -> Result<(), QuantityError> {
-        let remaining = self.original_quantity - self.executed_quantity;
-        if remaining < quantity {
-            // 冇 format!、冇 String —— 純 Copy 型 error
-            return Err(QuantityError::Overfill {
-                remaining,
-                requested: quantity,
-            });
-        }
-        self.executed_quantity += quantity;
-        self.remaining_quantity = remaining - quantity;
-        self.status = if self.remaining_quantity == 0 {
-            Status::Filled
-        } else {
-            Status::PartiallyFilled
-        };
-        Ok(())
-    }
-
-    /// 借用 self，唔再 consume 佢
-    pub fn is_filled(&self) -> bool {
-        self.remaining_quantity == 0
-    }
-}
-
-impl ModifyOrder {
-    fn new(order_id: Uuid, price: Price, quantity: Quantity, side: Side) -> Self {
-        let now = Utc::now().timestamp_millis();
-        ModifyOrder {
-            order_id,
             price,
             quantity,
-            side,
-            timestamp: now,
         }
     }
-    pub fn to_order_ptr(&self, order_type: OrderType) -> Rc<Order> {
-        Rc::new(Order::new(order_type, self.side, self.price, self.quantity))
-    }
-}
 
-#[cfg(test)]
-mod order_tests {
-    use super::*;
-
-    #[test]
-    fn check_new_order() {
-        let test_order: Order = Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10);
-        assert_eq!(test_order.price, 100);
-        assert_eq!(test_order.order_type, OrderType::GoodTillCancel);
-        assert_eq!(test_order.side, Side::Buy);
-        assert_eq!(test_order.original_quantity, 10);
-        assert_eq!(test_order.executed_quantity, 0);
-    }
-
-    #[test]
-    fn check_fill_quantity() {
-        let mut test_order: Order = Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10);
-        let _ = test_order.fill_qty(10);
-        assert_eq!(test_order.executed_quantity, 10);
-        assert_eq!(test_order.remaining_quantity, 0);
-        assert_eq!(test_order.is_filled(), true);
+    pub const fn market(client_order_id: ClientOrderId, side: Side, quantity: Quantity) -> Self {
+        NewOrder {
+            client_order_id,
+            order_type: OrderType::MarketOrder,
+            side,
+            price: 0,
+            quantity,
+        }
     }
 }

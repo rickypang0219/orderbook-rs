@@ -1,11 +1,7 @@
-use env_logger;
-use log::LevelFilter;
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rand::distributions::Uniform;
 use rand::prelude::*;
-use uuid::Uuid;
 
 pub mod alloc_guard;
 pub mod orderbook;
@@ -13,189 +9,142 @@ pub mod orderbook;
 #[global_allocator]
 static ALLOC: alloc_guard::Counting = alloc_guard::Counting;
 
-use orderbook::order::{Order, OrderType, Side};
-use orderbook::orderbook_impl::{OrderBook, TradeBuf};
+use orderbook::order::{NewOrder, Side};
+use orderbook::orderbook_impl::{BookConfig, OrderBook, TradeBuf};
+use orderbook::types::{ClientOrderId, OrderId};
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
 
 fn format_number(n: u64) -> String {
     let s = n.to_string();
-    let mut result = String::new();
-    let chars: Vec<char> = s.chars().rev().collect();
-    for (i, c) in chars.iter().enumerate() {
+    let mut out = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
         if i > 0 && i % 3 == 0 {
-            result.push(',');
+            out.push(',');
         }
-        result.push(*c);
+        out.push(c);
     }
-    result.chars().rev().collect()
+    out.chars().rev().collect()
 }
 
-fn benchmark_add_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new();
-    let mut trades = TradeBuf::default();
-
-    // Set up random number generator
-    let mut rng = thread_rng();
-    let price_dist = Uniform::new_inclusive(90, 110); // Price range [90, 110]
-    let qty_dist = Uniform::new_inclusive(1, 100); // Quantity range [1, 100]
-    let side_dist = Uniform::new_inclusive(0, 1); // Side: 0 (Sell) or 1 (Buy)
-
-    // Measure time for adding orders
-    alloc_guard::arm();
-    let start = Instant::now();
-
-    // Add random orders to the book
-    for _i in 0..num_orders {
-        let side = if side_dist.sample(&mut rng) == 1 {
-            Side::Buy
-        } else {
-            Side::Sell
-        };
-        let order = Arc::new(Order::new(
-            OrderType::GoodTillCancel,
-            side,
-            price_dist.sample(&mut rng), // Random price
-            qty_dist.sample(&mut rng),   // Random quantity
-        ));
-        trades.clear();
-        orderbook.add_order(&order, &mut trades).unwrap();
-    }
-
-    let duration = start.elapsed();
-    let (allocs, bytes) = alloc_guard::disarm();
-
-    let seconds = duration.as_secs_f64();
-    let orders_per_sec = if seconds > 0.0 {
-        (num_orders as f64 / seconds) as u64
+fn report(label: &str, n: u64, d: std::time::Duration, allocs: u64, bytes: u64) {
+    let secs = d.as_secs_f64();
+    let ops = if secs > 0.0 {
+        (n as f64 / secs) as u64
     } else {
         0
     };
-    let latency_us = duration.as_micros() as f64 / num_orders as f64;
-
-    // Print results
-    println!("Add {} orders:", format_number(num_orders));
-    println!("  Time: {:.2} ms", duration.as_micros() as f64 / 1000.0);
-    println!("  Throughput: {} orders/sec", format_number(orders_per_sec));
-    println!("  Latency: {:.3} μs/order", latency_us);
+    println!("{label} {}:", format_number(n));
+    println!("  Time: {:.2} ms", d.as_micros() as f64 / 1000.0);
+    println!("  Throughput: {} ops/sec", format_number(ops));
+    println!("  Latency: {:.3} us/op", d.as_micros() as f64 / n as f64);
     println!(
-        "  Allocations: {} ({:.2} per order, {} bytes)\n",
+        "  Allocations: {} ({:.4} per op, {} bytes)\n",
         format_number(allocs),
-        allocs as f64 / num_orders as f64,
+        allocs as f64 / n as f64,
         format_number(bytes)
     );
 }
 
-fn benchmark_cancel_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new();
-    let mut trades = TradeBuf::default();
-    let mut order_ids: Vec<Uuid> = Vec::with_capacity(num_orders as usize);
-
-    // Add orders to the book
-    for _i in 0..num_orders {
-        let order = Arc::new(Order::new(OrderType::GoodTillCancel, Side::Buy, 100, 10));
-        trades.clear();
-        orderbook.add_order(&order, &mut trades).unwrap();
-        order_ids.push(order.order_id);
+fn cfg(n: u64) -> BookConfig {
+    BookConfig {
+        max_orders: (n as usize) + 16,
+        max_levels: 4096,
     }
-
-    let start = Instant::now();
-
-    // Cancel all orders
-    for order_id in &order_ids {
-        orderbook.cancel_order(*order_id).unwrap();
-    }
-
-    let duration = start.elapsed();
-
-    let seconds = duration.as_secs_f64();
-    let cancels_per_sec = if seconds > 0.0 {
-        (num_orders as f64 / seconds) as u64
-    } else {
-        0
-    };
-    let latency_us = duration.as_micros() as f64 / num_orders as f64;
-
-    println!("Cancel {} orders:", format_number(num_orders));
-    println!("  Time: {:.2} ms", duration.as_micros() as f64 / 1000.0);
-    println!(
-        "  Throughput: {} cancels/sec",
-        format_number(cancels_per_sec)
-    );
-    println!("  Latency: {:.3} μs/cancel\n", latency_us);
 }
 
-fn benchmark_match_orders(num_orders: u64) {
-    let mut orderbook = OrderBook::new();
+fn benchmark_add_orders(n: u64) {
+    let mut book = OrderBook::with_config(cfg(n));
     let mut trades = TradeBuf::default();
-
-    // Set up random number generator for quantities
     let mut rng = thread_rng();
-    let qty_dist = Uniform::new_inclusive(1, 100); // Quantity range [1, 100]
+    let price = Uniform::new_inclusive(90, 110);
+    let qty = Uniform::new_inclusive(1, 100);
+    let side = Uniform::new_inclusive(0, 1);
+    let ts = now_ns();
 
-    // Fill one side of the book with buy orders
-    for _ in 0..num_orders / 2 {
-        let order = Arc::new(Order::new(
-            OrderType::GoodTillCancel,
-            Side::Buy,
-            100,                       // Fixed price
-            qty_dist.sample(&mut rng), // Random quantity
-        ));
-        trades.clear();
-        orderbook.add_order(&order, &mut trades).unwrap();
-    }
-
-    let mut trades_executed: u64 = 0;
+    alloc_guard::arm();
     let start = Instant::now();
-
-    // Add matching sell orders and measure matching speed
-    for _ in num_orders / 2..num_orders {
-        let order = Arc::new(Order::new(
-            OrderType::GoodTillCancel,
-            Side::Sell,
-            100,                       // Fixed price to match buy orders
-            qty_dist.sample(&mut rng), // Random quantity
-        ));
+    for i in 0..n {
+        let req = NewOrder::limit(
+            ClientOrderId(i),
+            if side.sample(&mut rng) == 1 {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
+            price.sample(&mut rng),
+            qty.sample(&mut rng),
+        );
         trades.clear();
-        orderbook.add_order(&order, &mut trades).unwrap();
-        trades_executed += trades.len() as u64;
+        let _ = book.submit(&req, &mut trades, ts);
+    }
+    let d = start.elapsed();
+    let (a, b) = alloc_guard::disarm();
+    report("Add", n, d, a, b);
+}
+
+fn benchmark_cancel_orders(n: u64) {
+    let mut book = OrderBook::with_config(cfg(n));
+    let mut trades = TradeBuf::default();
+    let mut ids: Vec<OrderId> = Vec::with_capacity(n as usize);
+    let ts = now_ns();
+
+    for i in 0..n {
+        trades.clear();
+        let req = NewOrder::limit(ClientOrderId(i), Side::Buy, 100, 10);
+        ids.push(book.submit(&req, &mut trades, ts).unwrap());
     }
 
-    let duration = start.elapsed();
+    alloc_guard::arm();
+    let start = Instant::now();
+    for id in &ids {
+        book.cancel(*id).unwrap();
+    }
+    let d = start.elapsed();
+    let (a, b) = alloc_guard::disarm();
+    report("Cancel", n, d, a, b);
+}
 
-    // Calculate metrics
-    let seconds = duration.as_secs_f64(); // Duration in seconds
-    let matches_per_sec = if seconds > 0.0 {
-        ((num_orders / 2) as f64 / seconds) as u64
-    } else {
-        0
-    };
-    let trades_per_sec = if seconds > 0.0 {
-        (trades_executed as f64 / seconds) as u64
-    } else {
-        0
-    };
+fn benchmark_match_orders(n: u64) {
+    let mut book = OrderBook::with_config(cfg(n));
+    let mut trades = TradeBuf::default();
+    let mut rng = thread_rng();
+    let qty = Uniform::new_inclusive(1, 100);
+    let ts = now_ns();
 
-    // Print results
-    println!("Match {} orders:", format_number(num_orders / 2));
-    println!("  Time: {:.2} ms", duration.as_micros() as f64 / 1000.0);
-    println!("  Trades executed: {}", format_number(trades_executed));
-    println!(
-        "  Throughput: {} matches/sec",
-        format_number(matches_per_sec)
-    );
-    println!(
-        "  Trade rate: {} trades/sec\n",
-        format_number(trades_per_sec)
-    );
+    for i in 0..n / 2 {
+        trades.clear();
+        let req = NewOrder::limit(ClientOrderId(i), Side::Buy, 100, qty.sample(&mut rng));
+        book.submit(&req, &mut trades, ts).unwrap();
+    }
+
+    let mut executed: u64 = 0;
+    alloc_guard::arm();
+    let start = Instant::now();
+    for i in n / 2..n {
+        let req = NewOrder::limit(ClientOrderId(i), Side::Sell, 100, qty.sample(&mut rng));
+        trades.clear();
+        let _ = book.submit(&req, &mut trades, ts);
+        executed += trades.len() as u64;
+    }
+    let d = start.elapsed();
+    let (a, b) = alloc_guard::disarm();
+    report("Match", n / 2, d, a, b);
+    println!("  Trades executed: {}\n", format_number(executed));
 }
 
 fn main() {
-    let num_orders: u64 = 1_000;
-
+    let n: u64 = 1_000_000;
     env_logger::Builder::new()
-        .filter_level(LevelFilter::Info)
+        .filter_level(log::LevelFilter::Warn)
         .init();
 
-    benchmark_add_orders(num_orders);
-    benchmark_cancel_orders(num_orders);
-    benchmark_match_orders(num_orders);
+    benchmark_add_orders(n);
+    benchmark_cancel_orders(n);
+    benchmark_match_orders(n);
 }
