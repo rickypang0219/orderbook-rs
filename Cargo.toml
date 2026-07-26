@@ -24,3 +24,9 @@ path = "src/main.rs"
 [[bin]]
 name = "benchmark"
 path = "src/benchmark.rs"
+
+
+
+[[bin]]
+name = "latency"
+path = "src/latency.rs"
