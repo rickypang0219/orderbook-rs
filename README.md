@@ -1,89 +1,108 @@
-# orderbook-rs
+# Rust order book
 
-A price-time-priority matching engine written in Rust. The project focuses on the mechanics that matter in an exchange order book: deterministic matching, price-level indexing, FIFO execution, constant-time cancellation within a level, and explicit management of a small unsafe boundary.
+Single-threaded, price-time priority matching with a fixed price band and capacity.
+The matching engine uses safe Rust and allocates only during construction.
 
 ## Design
 
+- A fixed arena stores 64-byte orders. IDs contain a slot index and generation,
+  so lookup needs no hash table and stale IDs are rejected.
+- Each price level holds an index-based doubly linked FIFO. Cancellation unlinks
+  an order directly; partial fills update it in place.
+- Prices map to a dense tick ladder. A hierarchical bitmap locates occupied levels.
+- Callers own and reuse a fixed-capacity `TradeBuf`.
+
+Let `D = O(log₆₄ T)` for `T` price ticks, `k` be the number of fills, and `L`
+be the number of visited price levels. The default grid has three bitmap layers.
+
+| Operation | Cost |
+|---|---|
+| Lookup by engine ID | O(1) |
+| FIFO append / unlink | O(1); O(D) when level occupancy changes |
+| Best bid / ask | O(D) |
+| Same-price quantity reduction | O(1) |
+| Matching | O(k + LD), draining each FIFO before the next bitmap search |
+| FOK liquidity check | O(LD), stops when sufficient quantity is found |
+
+`submit` also validates price, capacity and output space. When a constant-time
+upper bound cannot prove enough trade-buffer space, it scans prospective fills
+before making any changes. That scan can add O(k + LD) work. These bounds assume
+engine-assigned IDs; `ClientOrderId` is metadata, not a uniqueness index.
+
+## Orders and amendments
+
+Limit/GTC remainders rest on the book. Market/IOC remainders are canceled. FOK
+executes completely or is killed; a killed FOK returns an already-inactive ID.
+
 ```rust
-pub struct OrderBook {
-    bids: BTreeMap<Reverse<Price>, PriceLevelRef>,
-    asks: BTreeMap<Price, PriceLevelRef>,
-    orders: HashMap<OrderId, OrderEntry>,
-    price_levels: Vec<Option<PriceLevel>>,
-}
+use orderbook::{ClientOrderId, NewOrder, OrderBook, Side, TradeBuf};
+
+let mut book = OrderBook::new();
+let mut trades = TradeBuf::with_capacity(1024);
+let id = book.submit(
+    &NewOrder::limit(ClientOrderId(1), Side::Buy, 100, 10),
+    &mut trades,
+    0,
+).unwrap();
+book.amend(id, 100, 5, &mut trades, 0).unwrap();
+book.cancel(id).unwrap();
 ```
 
-- `BTreeMap` keeps price levels ordered and exposes the best bid/ask in O(log P), where `P` is active price levels.
-- Each price level is an intrusive FIFO linked list, preserving time priority.
-- `orders` maps an order ID to an owning node handle, enabling O(1) average lookup and unlink for cancellation.
-- Empty price-level slots are recycled to reduce allocation churn.
+`amend(id, price, remaining, out, timestamp)` keeps the engine ID:
 
-The cancellation fast path is O(1) average. Cancelling the final order at a price also removes its `BTreeMap` entry, which is O(log P), where `P` is the number of price levels. This distinction is intentional: describing every cancel as unconditionally O(1) would hide the price-level cleanup cost.
+- Same-price reductions preserve FIFO priority; increases and reprices lose it.
+- Reprices can match immediately. Zero remaining cancels, ignoring price.
+- Already executed quantity stays unchanged. `original_qty` becomes the amended
+  total (`executed + remaining`), rather than the first submitted quantity.
 
-## Order semantics
+On any returned error, `submit` and `amend` leave the book and trade buffer
+unchanged. A full output buffer never causes unreported fills. Existing trades
+remain in the buffer; callers clear it after consuming them.
 
-| Type | Behaviour |
-|---|---|
-| Limit / GTC | Match up to the limit price, then rest any remainder |
-| Market | Match available liquidity at any price; never rests |
-| IOC | Match immediately up to the limit price; cancel any remainder |
-| FOK | Execute the full quantity immediately or make no book change |
+Price-level volumes and amended totals reject overflow. Sequence/trade IDs never
+wrap. Exhausted slot generations permanently retire their slots, reducing usable
+capacity. Submissions need a free arena slot even when they would immediately fill.
 
-Trades execute at the resting order's price. Orders at the same price execute FIFO.
+## Verification and benchmarks
 
-## Correctness and unsafe-code discipline
-
-The order index stores an owning `Rc<OrderNode>` handle while the intrusive list owns another clone. A raw pointer is created only transiently, through `Rc::as_ptr`, to construct the cancellation cursor. Matching uses the safe `front_mut` cursor. The safety contract is:
-
-1. the indexed handle and list entry are created together;
-2. the owning handle keeps the node alive for the entire unsafe cursor operation;
-3. a partial fill that replaces a node also replaces the indexed handle;
-4. cancellation removes the list node and its index entry in the same operation.
-
-`OrderBook::validate_invariants` checks the pointer index, FIFO nodes, price maps, order counts, per-level volume, total quantity accounting, free-list integrity, and the uncrossed-book condition. Proptest applies random sequences of limit, market, IOC, FOK, and cancel operations and validates these invariants after every operation. A focused Miri test exercises the partial-fill/node-replacement/cancel lifecycle.
-
-```bash
+```sh
 cargo test --all-targets
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib partial_fill_updates_pointer_before_cancel
+cargo test --release --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo run --release --bin benchmark
+cargo run --release --bin latency
 ```
 
-CI runs formatting, Clippy with warnings denied, the full test suite, and the focused Miri check.
+Tests cover output exhaustion, amend priority, stale handles, overflow, allocation
+counts, and 5,000 deterministic mixed commands against a simple reference book.
 
-## Benchmark methodology
+The throughput benchmark generates random inputs before timing. The latency
+benchmark installs the counting allocator, separates stale-ID rejects from
+successful operations, and measures reductions, increases, reprices and price-level
+creation/removal separately. Measurements include timer overhead and are closed-loop;
+they do not measure queueing delay under load. Compare identical workloads/builds,
+not the old README's historical throughput figures.
 
-Benchmarks use Criterion in release mode:
+## Unsafe boundary
 
-```bash
-cargo bench --bench orderbook
-```
+No unchecked indexing or raw pointers are used for matching. Existing unsafe code
+is confined to the counting allocator and optional OS memory warm-up. Warm-up uses
+volatile **typed `Copy` values** to prevent page touches being optimized away;
+it does not read potentially uninitialized struct padding as `u8`.
+See [Rust's volatile safety requirements](https://doc.rust-lang.org/std/ptr/fn.read_volatile.html#safety)
+and [Rustonomicon: uninitialized memory](https://doc.rust-lang.org/nomicon/uninitialized.html).
+Memory locking / huge-page advice is best-effort; inspect the returned `MemReport`.
 
-Each sample processes a batch of 10,000 operations. `iter_batched` keeps book construction and input generation outside the timed section. Orders use deterministic, pre-generated UUIDs, so RNG, UUID generation, and input timestamps are not charged to add/cancel latency. The matching benchmark does include trade allocation, trade UUID generation, timestamps, filled-order removal, and index maintenance because those are part of the matching path.
+Order-state bitmaps, cached best prices and dirty-level feeds are deferred until
+profiling or an actual consumer justifies their additional state. Packing flags
+alone would not shrink the currently 64-byte-aligned order slots.
 
-Measured on a 14-inch MacBook Pro with M1 Max (20 Criterion samples, five-second measurement window):
+## Automated releases
 
-| Operation | Estimated throughput | 95% interval |
-|---|---:|---:|
-| Add resting orders, default capacity | 5.89 M orders/s | 5.88–5.91 M/s |
-| Add resting orders, preallocated | 7.33 M orders/s | 7.32–7.35 M/s |
-| Cancel orders | 7.30 M cancels/s | 7.29–7.31 M/s |
-| Match one resting order per incoming order | 0.81 M matches/s | 0.80–0.82 M/s |
-
-The previous ~150K add/s result was not representative. Its timed loop generated random inputs, UUIDs, timestamps, and heap allocations. More importantly, every incoming order allocated a trade vector with capacity equal to the entire resting-order count, turning a normally empty result into O(n) allocation work. The current implementation starts with an empty trade vector, and the Criterion setup isolates the operation under test.
-
-Criterion HTML reports are written under `target/criterion/report/index.html`.
-
-## Complexity
-
-Let `P` be active price levels and `F` the number of resting orders filled.
-
-| Operation | Complexity |
-|---|---|
-| Add to an existing level | O(1) average index work + O(1) FIFO append |
-| Add a new price level | O(log P) |
-| Cancel | O(1) average; O(log P) when removing an empty level |
-| Best bid / ask | O(log P) |
-| Match | O(F log P) in the current implementation |
-
-## CV-ready summary
-
-> Built a Rust price-time-priority matching engine supporting Limit/GTC, Market, IOC, and FOK orders. Designed ordered price-level indexing with intrusive FIFO queues and O(1)-average cancellation; managed raw-pointer invariants with property-based testing, structural validation, Miri, and CI. Reworked Criterion benchmarks to isolate setup from measurement, demonstrating 5.9–7.3M resting adds/s and 7.3M cancels/s on M1 Max.
+Pull requests run formatting, Clippy and debug/release tests on Linux and macOS.
+Miri checks the remaining typed page-touch code, including padded structs.
+After all checks pass on `main`, GitHub Actions publishes a development prerelease
+containing Linux x86_64 `main`, `benchmark` and `latency` binaries, the source commit,
+and a SHA-256 checksum. The `main` executable is a demonstration, not a server.
+Releases use GitHub's built-in token; no deployment credentials are required.
+This publishes downloadable builds, not a running exchange or a crates.io package.

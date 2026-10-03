@@ -1,863 +1,933 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::rc::Rc;
-use std::sync::Arc;
+use crate::orderbook::arena::{OrderArena, OrderSlot};
+use crate::orderbook::ladder::Ladder;
+use crate::orderbook::mem;
+use crate::orderbook::order::{NewOrder, OrderType, Side, Status};
+use crate::orderbook::price_level::LevelInfo;
+use crate::orderbook::types::{NIL, OrderId, Price, Quantity, TradeId};
 
-use chrono::Utc;
-use log::info;
-use uuid::Uuid;
+// ---------------------------------------------------------------- Trade / buf
 
-use crate::orderbook::order::{Order, OrderType, Side, Status};
-use crate::orderbook::price_level::{OrderEntry, OrderNode, PriceLevel};
-use crate::orderbook::types::{OrderId, Price, Quantity};
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Trade {
-    pub trade_id: OrderId,
+    pub trade_id: TradeId,
     pub bid_order_id: OrderId,
     pub ask_order_id: OrderId,
     pub price: Price,
     pub quantity: Quantity,
-    pub timestamp: i64,
+    /// Taker 嘅到達序號，令下游可以還原確定性次序
+    pub seq: u64,
+    /// 由 caller 傳入。每個 command 讀一次 clock，唔係每筆成交讀一次。
+    pub timestamp_ns: i64,
 }
 
-#[derive(Debug, thiserror::Error)]
+impl Trade {
+    pub const EMPTY: Trade = Trade {
+        trade_id: TradeId(0),
+        bid_order_id: OrderId::INVALID,
+        ask_order_id: OrderId::INVALID,
+        price: 0,
+        quantity: 0,
+        seq: 0,
+        timestamp_ns: 0,
+    };
+}
+
+/// 固定容量成交輸出 buffer。Caller 持有並重用。
+#[derive(Debug)]
+pub struct TradeBuf {
+    buf: Box<[Trade]>,
+    len: usize,
+}
+
+impl TradeBuf {
+    pub fn with_capacity(cap: usize) -> Self {
+        TradeBuf {
+            buf: vec![Trade::EMPTY; cap].into_boxed_slice(),
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Trade] {
+        &self.buf[..self.len]
+    }
+    #[inline(always)]
+    pub fn push(&mut self, t: Trade) -> bool {
+        if self.len == self.buf.len() {
+            return false;
+        }
+        self.buf[self.len] = t;
+        self.len += 1;
+        true
+    }
+}
+
+impl Default for TradeBuf {
+    fn default() -> Self {
+        Self::with_capacity(1024)
+    }
+}
+
+// -------------------------------------------------------------------- errors
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum OrderBookError {
-    #[error("Order not found: {order_id}")]
+    #[error("order not found: {order_id}")]
     OrderNotFound { order_id: OrderId },
 
-    #[error("Invalid price: {price}")]
-    InvalidPrice { price: Price },
-
-    #[error("Invalid quantity: {quantity}")]
+    #[error("invalid quantity: {quantity}")]
     InvalidQuantity { quantity: Quantity },
 
-    #[error("Order already exists: {order_id}")]
-    OrderAlreadyExists { order_id: OrderId },
+    #[error("price {price} is outside the ladder band or not on a tick boundary")]
+    PriceNotOnLadder { price: Price },
 
-    #[error("Price Level not found: {price}")]
-    PriceLevelNotFound { price: Price },
+    #[error("order arena is full")]
+    BookFull,
 
-    #[error("No PriceLevelRef not found: {price}")]
-    PriceLevelRefNotFound { price: Price },
+    #[error("trade buffer full")]
+    TradeBufferFull,
+
+    #[error("quantity or price-level volume overflow")]
+    QuantityOverflow,
+
+    #[error("sequence or trade ID exhausted")]
+    IdExhausted,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PriceLevelRef {
-    index: usize,
+// -------------------------------------------------------------------- config
+
+#[derive(Clone, Copy, Debug)]
+pub struct BookConfig {
+    /// 同時 live 嘅單數上限（arena slot 數）。
+    pub max_orders: usize,
+    /// Ladder tick 0 對應嘅價。
+    pub base_price: Price,
+    /// 最小報價單位。
+    pub tick_size: Price,
+    /// Ladder 有幾多格。價格帶 = [base, base + tick*(n-1)]。
+    pub num_ticks: usize,
 }
+
+impl Default for BookConfig {
+    fn default() -> Self {
+        BookConfig {
+            max_orders: 1 << 20, // 1,048,576 × 64 B = 64 MB
+            base_price: 0,
+            tick_size: 1,
+            num_ticks: 1 << 16, // 65,536 × 24 B × 2 sides ≈ 3.1 MB
+        }
+    }
+}
+
+// ---------------------------------------------------------------- order book
 
 pub struct OrderBook {
-    bids: BTreeMap<Reverse<Price>, PriceLevelRef>,
-    asks: BTreeMap<Price, PriceLevelRef>,
-    orders: HashMap<OrderId, OrderEntry>,
-    by_price: HashMap<Price, PriceLevelRef>,
-    price_levels: Vec<Option<PriceLevel>>,
-    free_indices: VecDeque<usize>,
+    arena: OrderArena,
+    bids: Ladder,
+    asks: Ladder,
+    next_seq: u64,
+    next_trade_id: u64,
 }
 
 impl Default for OrderBook {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Trade {
-    pub fn new(
-        bid_order_id: OrderId,
-        ask_order_id: OrderId,
-        price: Price,
-        quantity: Quantity,
-    ) -> Self {
-        Trade {
-            trade_id: Uuid::new_v4(),
-            bid_order_id,
-            ask_order_id,
-            price,
-            quantity,
-            timestamp: Utc::now().timestamp_micros(),
-        }
+        Self::with_config(BookConfig::default())
     }
 }
 
 impl OrderBook {
     pub fn new() -> Self {
-        Self::with_capacity(0, 1024)
+        Self::default()
     }
 
-    /// Creates a book with capacity reserved for a known workload.
-    pub fn with_capacity(order_capacity: usize, price_level_capacity: usize) -> Self {
-        let price_levels = Vec::with_capacity(price_level_capacity);
-        let free_indices = VecDeque::with_capacity(price_level_capacity);
-
+    /// **整個 engine 唯一嘅 allocation 點。**
+    /// 之後 submit / cancel 一個 malloc 都唔會做。
+    pub fn with_config(cfg: BookConfig) -> Self {
         OrderBook {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
-            orders: HashMap::with_capacity(order_capacity),
-            by_price: HashMap::with_capacity(price_level_capacity),
-            price_levels,
-            free_indices,
+            arena: OrderArena::with_capacity(cfg.max_orders),
+            bids: Ladder::new(cfg.base_price, cfg.tick_size, cfg.num_ticks),
+            asks: Ladder::new(cfg.base_price, cfg.tick_size, cfg.num_ticks),
+            next_seq: 0,
+            next_trade_id: 0,
         }
     }
 
-    fn add_order_to_book(&mut self, order: &Arc<Order>) {
-        let (price_level_ref, is_new_level) = match self.by_price.get(&order.price) {
-            None => {
-                let index = if let Some(index) = self.free_indices.pop_front() {
-                    self.price_levels[index] = Some(PriceLevel::new(order.price));
-                    index
-                } else {
-                    let index = self.price_levels.len();
-                    self.price_levels.push(Some(PriceLevel::new(order.price)));
-                    index
-                };
+    /// Step 8：pre-fault + mlock + hugepage。
+    ///
+    /// 喺開始收流量之前叫一次。冇佢嘅話頭幾千張單會食晒 page fault，
+    /// warm-up 期間嘅 p99 會好難睇。
+    pub fn warm_up(&mut self) -> mem::MemReport {
+        let a = mem::warm(self.arena.slots_mut());
+        let b = mem::warm(self.bids.levels_mut());
+        let c = mem::warm(self.asks.levels_mut());
+        mem::MemReport {
+            bytes_prefaulted: a.bytes_prefaulted + b.bytes_prefaulted + c.bytes_prefaulted,
+            locked: a.locked && b.locked && c.locked,
+            hugepage_advised: a.hugepage_advised,
+        }
+    }
 
-                // Create new level reference and append it to HashMap
-                let level_ref = PriceLevelRef { index };
-                self.by_price.insert(order.price, level_ref);
-                (level_ref, true)
-            }
-            Some(price_level_ref) => (*price_level_ref, false),
-        };
+    /// Accept an order. On Err, both the book and output buffer are unchanged.
+    /// A killed FOK returns an ID which is already inactive.
+    pub fn submit(
+        &mut self,
+        req: &NewOrder,
+        out: &mut TradeBuf,
+        ts_ns: i64,
+    ) -> Result<OrderId, OrderBookError> {
+        let execute = self.preflight(req, out, None)?;
+        let seq = self.next_seq + 1;
+        let id = self
+            .arena
+            .alloc(OrderSlot::incoming(
+                req.client_order_id,
+                req.order_type,
+                req.side,
+                req.price,
+                req.quantity,
+                seq,
+            ))
+            .ok_or(OrderBookError::BookFull)?;
+        self.next_seq = seq;
+        if execute {
+            self.execute(id, req, out, ts_ns);
+        } else {
+            self.arena.free(id);
+        }
+        Ok(id)
+    }
 
-        // Find the PriceLevel using Index in PriceLevelRef
-        let node = self.price_levels[price_level_ref.index]
-            .as_mut()
-            .expect("Price Level cannot be None!")
-            .add_order_return_handle(order.clone());
-        let order_entry = OrderEntry { node };
-        self.orders.insert(order.order_id, order_entry);
-
-        if is_new_level {
-            match order.side {
-                Side::Buy => self.bids.insert(Reverse(order.price), price_level_ref),
-                Side::Sell => self.asks.insert(order.price, price_level_ref),
+    /// Set a resting order's price and remaining quantity, preserving its ID.
+    /// Same-price reductions keep FIFO priority; increases/reprices lose it.
+    /// Zero cancels (price is ignored). Executed quantity is preserved.
+    /// On Err, the original order and output buffer are unchanged.
+    pub fn amend(
+        &mut self,
+        id: OrderId,
+        price: Price,
+        remaining: Quantity,
+        out: &mut TradeBuf,
+        ts_ns: i64,
+    ) -> Result<(), OrderBookError> {
+        let old = *self
+            .arena
+            .get(id)
+            .filter(|s| s.is_resting())
+            .ok_or(OrderBookError::OrderNotFound { order_id: id })?;
+        if remaining == 0 {
+            return self.cancel(id);
+        }
+        let original = old
+            .executed_qty()
+            .checked_add(remaining)
+            .ok_or(OrderBookError::QuantityOverflow)?;
+        if price == old.price && remaining <= old.remaining_qty {
+            let ladder = match old.side {
+                Side::Buy => &mut self.bids,
+                Side::Sell => &mut self.asks,
             };
+            ladder.reduce_volume(old.level, old.remaining_qty - remaining);
+            let slot = self.arena.at_mut(id.slot());
+            slot.remaining_qty = remaining;
+            slot.original_qty = original;
+            return Ok(());
         }
-    }
-    pub fn add_order(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        if self.orders.contains_key(&order.order_id) {
-            return Err(OrderBookError::OrderAlreadyExists {
-                order_id: order.order_id,
-            });
-        }
-        if order.original_quantity == 0 {
-            return Err(OrderBookError::InvalidQuantity {
-                quantity: order.original_quantity,
-            });
-        }
-        if order.order_type != OrderType::MarketOrder && order.price <= 0 {
-            return Err(OrderBookError::InvalidPrice { price: order.price });
-        }
-
-        match order.order_type {
-            OrderType::MarketOrder => self.match_market(order),
-            OrderType::ImmediateOrCancel => self.match_order(order),
-            OrderType::FillOrKill => self.match_fill_or_kill(order),
-            _ => self.match_and_add_to_book(order),
-        }
-    }
-
-    pub fn cancel_order(&mut self, order_id: OrderId) -> Result<(), OrderBookError> {
-        let order_entry = self
-            .orders
-            .remove(&order_id)
-            .ok_or(OrderBookError::OrderNotFound { order_id })?;
-
-        let order = order_entry.node.order.clone();
-
-        let level_ref = match order.side {
-            Side::Buy => self.bids.get(&Reverse(order.price)).copied(),
-            Side::Sell => self.asks.get(&order.price).copied(),
-        }
-        .ok_or(OrderBookError::PriceLevelRefNotFound { price: order.price })?;
-
-        let level = self.price_levels[level_ref.index]
-            .as_mut()
-            .ok_or(OrderBookError::PriceLevelNotFound { price: order.price })?;
-        level
-            .remove_by_handle(&order_entry.node)
-            .ok_or(OrderBookError::OrderNotFound { order_id })?;
-
-        if level.order_count == 0 {
-            match order.side {
-                Side::Buy => {
-                    self.bids.remove(&Reverse(order.price));
-                }
-                Side::Sell => {
-                    self.asks.remove(&order.price);
-                }
-            }
-            self.price_levels[level_ref.index] = None;
-            self.free_indices.push_back(level_ref.index);
-            self.by_price.remove(&order.price);
-        }
+        let req = NewOrder {
+            client_order_id: old.client_order_id,
+            order_type: old.order_type,
+            side: old.side,
+            price,
+            quantity: remaining,
+        };
+        self.preflight(&req, out, Some(&old))?;
+        self.unlink(id);
+        self.next_seq += 1;
+        let slot = self.arena.at_mut(id.slot());
+        slot.price = price;
+        slot.remaining_qty = remaining;
+        slot.original_qty = original;
+        slot.seq = self.next_seq;
+        self.execute(id, &req, out, ts_ns);
         Ok(())
     }
 
-    fn match_order(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        // Most incoming orders trade at only one or two levels. Reserving by the
-        // total resting order count made every add O(n) in allocation volume and
-        // was the main cause of the misleading ~150K adds/sec result.
-        let mut trades = Vec::new();
-        let order_price: Price = order.price;
-        let mut remaining_quantity: Quantity = order.remaining_quantity;
-        let order_type: OrderType = order.order_type;
-
-        match order.side {
-            Side::Buy => {
-                while remaining_quantity > 0 {
-                    let best_ask = if let Some((&price, _)) = self.asks.iter().next() {
-                        price
-                    } else {
-                        // Price level does not exist -> break matching
-                        break;
-                    };
-
-                    if order_price >= best_ask || order_type == OrderType::MarketOrder {
-                        let trade = self.match_at_price_level_optimized(
-                            best_ask,
-                            order,
-                            remaining_quantity,
-                        )?;
-                        remaining_quantity -= trade.quantity;
-                        trades.push(trade);
-                    } else {
-                        break;
-                    };
-                    // sleep 0.5s for debug purpose
-                    // thread::sleep(Duration::from_millis(500));
-                }
-            }
-            Side::Sell => {
-                while remaining_quantity > 0 {
-                    let best_bid = if let Some((&Reverse(price), _)) = self.bids.iter().next() {
-                        price
-                    } else {
-                        // Price level does not exist -> break matching
-                        break;
-                    };
-
-                    if order_price <= best_bid || order_type == OrderType::MarketOrder {
-                        let trade = self.match_at_price_level_optimized(
-                            best_bid,
-                            order,
-                            remaining_quantity,
-                        )?;
-                        remaining_quantity -= trade.quantity;
-                        trades.push(trade);
-                    } else {
-                        break;
-                    };
-                    // sleep 0.5s for debug purpose
-                    // thread::sleep(Duration::from_millis(500));
-                }
-            }
+    pub fn cancel(&mut self, id: OrderId) -> Result<(), OrderBookError> {
+        if !self.arena.get(id).is_some_and(|s| s.is_resting()) {
+            return Err(OrderBookError::OrderNotFound { order_id: id });
         }
-        Ok(trades)
+        self.unlink(id);
+        self.arena.free(id);
+        Ok(())
     }
 
-    fn match_at_price_level_optimized(
-        &mut self,
-        best_price: Price,
-        incoming_order: &Arc<Order>,
-        max_quantity: Quantity,
-    ) -> Result<Trade, OrderBookError> {
-        let level_ref = match incoming_order.side {
-            Side::Buy => self.asks.get(&best_price).copied(),
-            Side::Sell => self.bids.get(&Reverse(best_price)).copied(),
+    fn ladder(&self, side: Side) -> &Ladder {
+        match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
         }
-        .ok_or(OrderBookError::PriceLevelNotFound { price: best_price })?;
+    }
 
-        let level_index = level_ref.index;
-        let (trade, resting_id, replacement, level_is_empty) = {
-            let price_level = self.price_levels[level_index]
-                .as_mut()
-                .ok_or(OrderBookError::PriceLevelNotFound { price: best_price })?;
+    fn crosses(req: &NewOrder, price: Price) -> bool {
+        req.order_type.is_market()
+            || match req.side {
+                Side::Buy => req.price >= price,
+                Side::Sell => req.price <= price,
+            }
+    }
 
-            // The matching path always consumes FIFO, so a safe front cursor is
-            // sufficient; raw-pointer cursor construction is reserved for cancel.
-            let mut cursor = price_level.orders.front_mut();
-            let resting_order = cursor
-                .get()
-                .expect("cursor created from the front node must be valid")
-                .order
-                .clone();
-            let trade_quantity = max_quantity.min(resting_order.remaining_quantity);
-            let (bid_order_id, ask_order_id) = match incoming_order.side {
-                Side::Buy => (incoming_order.order_id, resting_order.order_id),
-                Side::Sell => (resting_order.order_id, incoming_order.order_id),
+    /// Validate all fallible work before touching orders or emitting trades.
+    /// Usually no maker scan is needed: each fill consumes >= 1 quantity and
+    /// one live maker, so min(quantity, live orders) bounds the number of fills.
+    fn preflight(
+        &self,
+        req: &NewOrder,
+        out: &TradeBuf,
+        replaced: Option<&OrderSlot>,
+    ) -> Result<bool, OrderBookError> {
+        if req.quantity == 0 {
+            return Err(OrderBookError::InvalidQuantity { quantity: 0 });
+        }
+        let own = self.ladder(req.side);
+        let tick = own.tick_of(req.price);
+        if !req.order_type.is_market() && tick.is_none() {
+            return Err(OrderBookError::PriceNotOnLadder { price: req.price });
+        }
+        if self.next_seq == u64::MAX {
+            return Err(OrderBookError::IdExhausted);
+        }
+        if req.order_type == OrderType::FillOrKill && !self.has_liquidity(req) {
+            return Ok(false);
+        }
+        let volume = if req.order_type.rests_on_book() {
+            let tick = tick.expect("validated limit price");
+            own.level(tick).volume
+                - replaced
+                    .filter(|s| s.level == tick)
+                    .map_or(0, |s| s.remaining_qty)
+        } else {
+            0
+        };
+        let fills_bound = req.quantity.min(u64::from(self.arena.live()));
+        let room = (out.capacity() - out.len()) as u64;
+        let ids_left = u64::MAX - self.next_trade_id;
+        if fills_bound <= room
+            && fills_bound <= ids_left
+            && volume.checked_add(req.quantity).is_some()
+        {
+            return Ok(true);
+        }
+
+        let maker_side = req.side.opposite();
+        let ladder = self.ladder(maker_side);
+        let mut tick = ladder.best_tick(maker_side);
+        let mut remaining = req.quantity;
+        let mut fills = 0;
+        while let Some(t) = tick {
+            if remaining == 0 || !Self::crosses(req, ladder.price_of(t)) {
+                break;
+            }
+            let mut slot = ladder.level(t).head;
+            while slot != NIL && remaining > 0 {
+                fills += 1;
+                if fills > room {
+                    return Err(OrderBookError::TradeBufferFull);
+                }
+                if fills > ids_left {
+                    return Err(OrderBookError::IdExhausted);
+                }
+                let maker = self.arena.at(slot);
+                remaining -= remaining.min(maker.remaining_qty);
+                slot = maker.next;
+            }
+            tick = ladder.next_tick(maker_side, t);
+        }
+        if req.order_type.rests_on_book() && volume.checked_add(remaining).is_none() {
+            return Err(OrderBookError::QuantityOverflow);
+        }
+        Ok(true)
+    }
+
+    /// Stop as soon as enough liquidity is found; subtraction cannot overflow.
+    fn has_liquidity(&self, req: &NewOrder) -> bool {
+        let side = req.side.opposite();
+        let ladder = self.ladder(side);
+        let mut tick = ladder.best_tick(side);
+        let mut needed = req.quantity;
+        while let Some(t) = tick {
+            if !Self::crosses(req, ladder.price_of(t)) {
+                break;
+            }
+            let volume = ladder.level(t).volume;
+            if volume >= needed {
+                return true;
+            }
+            needed -= volume;
+            tick = ladder.next_tick(side, t);
+        }
+        false
+    }
+
+    fn unlink(&mut self, id: OrderId) {
+        let slot = self.arena.at(id.slot());
+        let tick = slot.level;
+        let ladder = match slot.side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        ladder.unlink(&mut self.arena, tick, id.slot());
+    }
+
+    /// Preflight guarantees capacity and arithmetic bounds; no recoverable errors here.
+    fn execute(&mut self, id: OrderId, req: &NewOrder, out: &mut TradeBuf, ts_ns: i64) {
+        let traded = self.match_taker(id, req, out, ts_ns);
+        let slot = self.arena.at_mut(id.slot());
+        slot.remaining_qty -= traded;
+        if slot.remaining_qty == 0 || !req.order_type.rests_on_book() {
+            self.arena.free(id);
+            return;
+        }
+        slot.status = if slot.executed_qty() > 0 {
+            Status::PartiallyFilled
+        } else {
+            Status::New
+        };
+        let ladder = match req.side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let tick = ladder.tick_of(req.price).expect("validated limit price");
+        slot.level = tick;
+        ladder.push_back(&mut self.arena, tick, id.slot());
+    }
+
+    fn match_taker(
+        &mut self,
+        taker: OrderId,
+        req: &NewOrder,
+        out: &mut TradeBuf,
+        ts_ns: i64,
+    ) -> Quantity {
+        let maker_side = req.side.opposite();
+        let ladder = match maker_side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let arena = &mut self.arena;
+        let seq = arena.at(taker.slot()).seq;
+        let mut remaining = req.quantity;
+        while remaining > 0 {
+            let Some(tick) = ladder.best_tick(maker_side) else {
+                break;
             };
-            let trade = Trade::new(bid_order_id, ask_order_id, best_price, trade_quantity);
+            let price = ladder.price_of(tick);
+            if !Self::crosses(req, price) {
+                break;
+            }
+            // Drain this FIFO before searching the bitmap again.
+            while remaining > 0 && !ladder.level(tick).is_empty() {
+                let head = ladder.level(tick).head;
+                let maker = arena.id_at(head);
+                let qty = remaining.min(arena.at(head).remaining_qty);
+                debug_assert!(qty > 0);
+                if qty == arena.at(head).remaining_qty {
+                    ladder.unlink(arena, tick, head);
+                    arena.free(maker);
+                } else {
+                    ladder.reduce_volume(tick, qty);
+                    let slot = arena.at_mut(head);
+                    slot.remaining_qty -= qty;
+                    slot.status = Status::PartiallyFilled;
+                }
+                let (bid_order_id, ask_order_id) = match req.side {
+                    Side::Buy => (taker, maker),
+                    Side::Sell => (maker, taker),
+                };
+                self.next_trade_id += 1;
+                assert!(
+                    out.push(Trade {
+                        trade_id: TradeId(self.next_trade_id),
+                        bid_order_id,
+                        ask_order_id,
+                        price,
+                        quantity: qty,
+                        seq,
+                        timestamp_ns: ts_ns,
+                    }),
+                    "preflight reserved trade capacity"
+                );
+                remaining -= qty;
+            }
+        }
+        req.quantity - remaining
+    }
 
-            let replacement = if trade_quantity == resting_order.remaining_quantity {
-                cursor.remove();
-                price_level.order_count -= 1;
+    // ------------------------------------------------------------------ query
+
+    #[inline]
+    pub fn get(&self, id: OrderId) -> Option<&OrderSlot> {
+        self.arena.get(id)
+    }
+
+    #[inline]
+    pub fn get_best_bid(&self) -> Option<Price> {
+        self.bids.highest_tick().map(|t| self.bids.price_of(t))
+    }
+
+    #[inline]
+    pub fn get_best_ask(&self) -> Option<Price> {
+        self.asks.lowest_tick().map(|t| self.asks.price_of(t))
+    }
+
+    pub fn best_bid_level(&self) -> Option<LevelInfo> {
+        self.bids.highest_tick().map(|t| self.bids.level_info(t))
+    }
+
+    pub fn best_ask_level(&self) -> Option<LevelInfo> {
+        self.asks.lowest_tick().map(|t| self.asks.level_info(t))
+    }
+
+    /// 由 best bid 向下走 `depth` 個 occupied level，寫入 `out`。
+    /// `out` 由 caller 提供並重用 —— market data snapshot 都唔應該 allocate。
+    pub fn bid_depth(&self, out: &mut [LevelInfo]) -> usize {
+        let mut n = 0;
+        let mut tick = self.bids.highest_tick();
+        while let (Some(t), true) = (tick, n < out.len()) {
+            out[n] = self.bids.level_info(t);
+            n += 1;
+            tick = if t == 0 {
                 None
             } else {
-                let mut updated_order = (*resting_order).clone();
-                updated_order.remaining_quantity -= trade_quantity;
-                updated_order.executed_quantity += trade_quantity;
-                updated_order.status = Status::PartiallyFilled;
-                updated_order.timestamp = Utc::now().timestamp_micros();
-                let updated_order = Arc::new(updated_order);
-
-                let updated_node = Rc::new(OrderNode::new(updated_order));
-                let indexed_node = updated_node.clone();
-                cursor
-                    .replace_with(updated_node)
-                    .expect("a cursor on the front node cannot be null");
-                Some(indexed_node)
+                self.bids.next_occupied_below(t - 1)
             };
-
-            price_level.volume -= trade_quantity;
-            (
-                trade,
-                resting_order.order_id,
-                replacement,
-                price_level.orders.is_empty(),
-            )
-        };
-
-        if let Some(updated_node) = replacement {
-            let entry = self
-                .orders
-                .get_mut(&resting_id)
-                .ok_or(OrderBookError::OrderNotFound {
-                    order_id: resting_id,
-                })?;
-            entry.node = updated_node;
-        } else {
-            self.orders.remove(&resting_id);
         }
-
-        if level_is_empty {
-            self.remove_empty_price_level(best_price, incoming_order)?;
-        }
-
-        Ok(trade)
+        n
     }
 
-    fn remove_empty_price_level(
-        &mut self,
-        price: Price,
-        order: &Arc<Order>,
-    ) -> Result<(), OrderBookError> {
-        match order.side {
-            Side::Buy => {
-                if let Some(price_level_ref) = self.asks.remove(&price) {
-                    // reset to None
-                    self.price_levels[price_level_ref.index] = None;
-                    // store index for later reuse
-                    self.free_indices.push_back(price_level_ref.index);
-                    // remove by_price
-                    self.by_price.remove(&price);
-                } else {
-                    return Err(OrderBookError::PriceLevelNotFound { price });
-                }
-            }
-            Side::Sell => {
-                if let Some(price_level_ref) = self.bids.remove(&Reverse(price)) {
-                    self.price_levels[price_level_ref.index] = None;
-                    self.free_indices.push_back(price_level_ref.index);
-                    self.by_price.remove(&price);
-                } else {
-                    return Err(OrderBookError::PriceLevelNotFound { price });
-                }
-            }
+    pub fn ask_depth(&self, out: &mut [LevelInfo]) -> usize {
+        let mut n = 0;
+        let mut tick = self.asks.lowest_tick();
+        while let (Some(t), true) = (tick, n < out.len()) {
+            out[n] = self.asks.level_info(t);
+            n += 1;
+            tick = self.asks.next_occupied_above(t + 1);
         }
-        Ok(())
+        n
     }
 
-    fn match_and_add_to_book(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        let trades = self.match_order(order)?;
-
-        let traded_quantity: Quantity = trades.iter().map(|trade| trade.quantity).sum();
-        let remaining_quantity = order.remaining_quantity - traded_quantity;
-
-        if remaining_quantity > 0 {
-            let mut remaining_order = order.as_ref().clone();
-            remaining_order.remaining_quantity = remaining_quantity;
-            remaining_order.executed_quantity += traded_quantity;
-            if traded_quantity > 0 {
-                remaining_order.status = Status::PartiallyFilled;
-                remaining_order.timestamp = Utc::now().timestamp_micros();
-            }
-            self.add_order_to_book(&Arc::new(remaining_order));
-        }
-
-        Ok(trades)
+    #[inline]
+    pub fn live_orders(&self) -> u32 {
+        self.arena.live()
     }
 
-    fn match_market(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        let aggressive_price = match order.side {
-            Side::Buy => Price::MAX, // buy at any price
-            Side::Sell => 0,         // sell at any price
-        };
-
-        let mut order_arc = order.as_ref().clone();
-        order_arc.price = aggressive_price;
-        self.match_order(&Arc::new(order_arc))
-    }
-
-    fn match_fill_or_kill(&mut self, order: &Arc<Order>) -> Result<Vec<Trade>, OrderBookError> {
-        let available_quantity: Quantity = self.get_available_quantity(order);
-
-        if available_quantity < order.remaining_quantity {
-            info!("FOK order is canceled due to insufficient quantity!");
-            Ok(Vec::new())
-        } else {
-            info!("Return FOK match orders");
-            self.match_order(order)
-        }
-    }
-
-    // Handy function to sum over volume over vector indices
-    fn sum_volume_at<I>(&self, indices: I) -> Quantity
-    where
-        I: IntoIterator<Item = usize>,
-    {
-        indices
-            .into_iter()
-            .filter_map(|i| self.price_levels.get(i).and_then(|opt| opt.as_ref()))
-            .map(|level| level.volume)
-            .sum()
-    }
-
-    fn get_available_quantity(&self, order: &Arc<Order>) -> Quantity {
-        match order.side {
-            Side::Buy => self.sum_volume_at(
-                self.asks
-                    .range(..=order.price)
-                    .map(|(_, level_ref)| level_ref.index),
-            ),
-            Side::Sell => self.sum_volume_at(
-                self.bids
-                    .range(..=Reverse(order.price))
-                    .map(|(_, level_ref)| level_ref.index),
-            ),
-        }
-    }
-
-    /// Returns the number of orders currently resting in the book.
-    pub fn resting_order_count(&self) -> usize {
-        self.orders.len()
-    }
-
-    /// Returns the total remaining quantity across all resting orders.
-    pub fn total_resting_quantity(&self) -> Quantity {
-        self.price_levels
-            .iter()
-            .filter_map(Option::as_ref)
-            .map(|level| level.volume)
-            .sum()
-    }
-
-    /// Checks the structural and accounting invariants that make raw-pointer
-    /// cancellation safe.
-    pub fn validate_invariants(&self) -> Result<(), String> {
-        if let (Some(best_bid), Some(best_ask)) = (self.get_best_bid(), self.get_best_ask())
-            && best_bid >= best_ask
-        {
-            return Err(format!(
-                "crossed book: best bid {best_bid} >= best ask {best_ask}"
-            ));
-        }
-
-        let active_levels = self.price_levels.iter().flatten().count();
-        if active_levels != self.bids.len() + self.asks.len() {
-            return Err(format!(
-                "active level count {active_levels} != bid levels {} + ask levels {}",
-                self.bids.len(),
-                self.asks.len()
-            ));
-        }
-        if active_levels != self.by_price.len() {
-            return Err(format!(
-                "active level count {active_levels} != price index count {}",
-                self.by_price.len()
-            ));
-        }
-
-        let mut seen_orders = HashSet::with_capacity(self.orders.len());
-        let mut node_count = 0usize;
-        for (Reverse(price), level_ref) in &self.bids {
-            node_count += self.validate_level(*price, Side::Buy, *level_ref, &mut seen_orders)?;
-        }
-        for (price, level_ref) in &self.asks {
-            node_count += self.validate_level(*price, Side::Sell, *level_ref, &mut seen_orders)?;
-        }
-
-        if node_count != self.orders.len() {
-            return Err(format!(
-                "list node count {node_count} != order index count {}",
-                self.orders.len()
-            ));
-        }
-
-        let mut free_indices = HashSet::with_capacity(self.free_indices.len());
-        for &index in &self.free_indices {
-            if !free_indices.insert(index) {
-                return Err(format!("duplicate free price-level index {index}"));
-            }
-            if self.price_levels.get(index).is_none_or(Option::is_some) {
-                return Err(format!(
-                    "free index {index} does not reference an empty slot"
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_level(
-        &self,
-        expected_price: Price,
-        expected_side: Side,
-        level_ref: PriceLevelRef,
-        seen_orders: &mut HashSet<OrderId>,
-    ) -> Result<usize, String> {
-        let indexed_ref = self
-            .by_price
-            .get(&expected_price)
-            .ok_or_else(|| format!("price {expected_price} missing from by_price index"))?;
-        if indexed_ref.index != level_ref.index {
-            return Err(format!(
-                "price {expected_price} points to conflicting level indices"
-            ));
-        }
-
-        let level = self
-            .price_levels
-            .get(level_ref.index)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| format!("price {expected_price} points to an empty level"))?;
-        if level.price != expected_price {
-            return Err(format!(
-                "level price {} != map price {expected_price}",
-                level.price
-            ));
-        }
-
-        let mut count = 0usize;
-        let mut volume = 0u64;
-        for node in level.orders.iter() {
-            let order = &node.order;
-            if order.price != expected_price || order.side != expected_side {
-                return Err(format!(
-                    "order {} is indexed under the wrong price or side",
-                    order.order_id
-                ));
-            }
-            if order.remaining_quantity == 0 {
-                return Err(format!("filled order {} is still resting", order.order_id));
-            }
-            if order.remaining_quantity + order.executed_quantity != order.original_quantity {
-                return Err(format!(
-                    "order {} quantity accounting is inconsistent",
-                    order.order_id
-                ));
-            }
-            if !seen_orders.insert(order.order_id) {
-                return Err(format!("duplicate resting order {}", order.order_id));
-            }
-
-            let entry = self
-                .orders
-                .get(&order.order_id)
-                .ok_or_else(|| format!("order {} missing from order index", order.order_id))?;
-            if !std::ptr::eq(entry.node.as_ref(), node) {
-                return Err(format!("stale pointer for order {}", order.order_id));
-            }
-            if !Arc::ptr_eq(&entry.node.order, order) {
-                return Err(format!("order {} has stale indexed data", order.order_id));
-            }
-
-            count += 1;
-            volume = volume
-                .checked_add(order.remaining_quantity)
-                .ok_or_else(|| format!("volume overflow at price {expected_price}"))?;
-        }
-
-        if count != level.order_count {
-            return Err(format!(
-                "level {expected_price} node count {count} != stored count {}",
-                level.order_count
-            ));
-        }
-        if volume != level.volume {
-            return Err(format!(
-                "level {expected_price} summed volume {volume} != stored volume {}",
-                level.volume
-            ));
-        }
-
-        Ok(count)
-    }
-
-    pub fn get_best_bid(&self) -> Option<Price> {
-        if let Some((Reverse(price), _)) = self.bids.iter().next() {
-            info!("Best bid price: {}", price);
-            Some(*price)
-        } else {
-            info!("No bid price available");
-
-            None
-        }
-    }
-
-    pub fn get_best_ask(&self) -> Option<Price> {
-        if let Some((price, _)) = self.asks.iter().next() {
-            info!("Best ask price: {}", price);
-            Some(*price)
-        } else {
-            info!("No ask price available");
-            None
-        }
+    #[inline]
+    pub fn level_count(&self) -> u32 {
+        self.bids.live_levels() + self.asks.live_levels()
     }
 }
+
+// ------------------------------------------------------------------- tests
 
 #[cfg(test)]
 mod orderbook_tests {
     use super::*;
-    use proptest::prelude::*;
+    use crate::orderbook::types::ClientOrderId;
 
-    fn order(
-        id: u128,
-        order_type: OrderType,
-        side: Side,
-        price: Price,
-        quantity: Quantity,
-    ) -> Arc<Order> {
-        Arc::new(Order::with_id(
-            Uuid::from_u128(id),
-            order_type,
-            side,
-            price,
-            quantity,
-        ))
+    const TS: i64 = 1_700_000_000_000_000_000;
+
+    /// band = [-100, 923]，tick 1
+    fn book() -> OrderBook {
+        OrderBook::with_config(BookConfig {
+            max_orders: 256,
+            base_price: -100,
+            tick_size: 1,
+            num_ticks: 1024,
+        })
+    }
+
+    fn buf() -> TradeBuf {
+        TradeBuf::with_capacity(64)
+    }
+
+    fn limit(n: u64, side: Side, price: Price, qty: Quantity) -> NewOrder {
+        NewOrder::limit(ClientOrderId(n), side, price, qty)
     }
 
     #[test]
-    fn check_add_new_limit_order() {
-        let mut test_ob = OrderBook::new();
-        let limit_order = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 10, 10));
-        let trades = test_ob.add_order(&limit_order).unwrap();
-        assert_eq!(trades, Vec::new());
+    fn exhausted_counters_reject_before_mutation() {
+        let (mut ob, mut out) = (book(), buf());
+        let id = ob
+            .submit(&limit(1, Side::Sell, 100, 2), &mut out, TS)
+            .unwrap();
+        let before = *ob.get(id).unwrap();
+        ob.next_trade_id = u64::MAX;
+        assert_eq!(
+            ob.submit(
+                &NewOrder::market(ClientOrderId(2), Side::Buy, 1),
+                &mut out,
+                TS
+            ),
+            Err(OrderBookError::IdExhausted)
+        );
+        assert_eq!(*ob.get(id).unwrap(), before);
+        assert!(out.is_empty());
+        ob.next_seq = u64::MAX;
+        assert_eq!(
+            ob.submit(&limit(3, Side::Buy, 99, 1), &mut out, TS),
+            Err(OrderBookError::IdExhausted)
+        );
+        assert_eq!(
+            ob.amend(id, 101, 2, &mut out, TS),
+            Err(OrderBookError::IdExhausted)
+        );
+        assert_eq!(*ob.get(id).unwrap(), before);
+        ob.cancel(id).unwrap();
     }
 
     #[test]
-    fn check_add_new_limit_order_and_later_comsumed_by_market_order() {
-        let mut test_ob = OrderBook::new();
-        let limit_order = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 10, 10));
-        let market_order = Arc::new(Order::new(OrderType::MarketOrder, Side::Sell, 10, 10));
+    fn resting_limit_order_is_addressable_by_returned_id() {
+        let (mut ob, mut b) = (book(), buf());
+        let id = ob.submit(&limit(1, Side::Buy, 10, 10), &mut b, TS).unwrap();
+        assert!(b.is_empty());
+        assert_eq!(ob.get_best_bid(), Some(10));
+        assert_eq!(ob.get(id).unwrap().remaining_qty, 10);
+        assert_eq!(ob.get(id).unwrap().client_order_id, ClientOrderId(1));
+    }
 
-        // limit order first arrives to the OB
+    #[test]
+    fn market_order_consumes_the_book() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Buy, 10, 10), &mut b, TS).unwrap();
+        b.clear();
+        ob.submit(
+            &NewOrder::market(ClientOrderId(2), Side::Sell, 10),
+            &mut b,
+            TS,
+        )
+        .unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.as_slice()[0].price, 10);
+        assert_eq!(ob.get_best_bid(), None);
+        assert_eq!(ob.live_orders(), 0);
+        assert_eq!(ob.level_count(), 0);
+    }
+
+    #[test]
+    fn price_time_priority_is_fifo_within_a_level() {
+        let (mut ob, mut b) = (book(), buf());
+        let first = ob.submit(&limit(1, Side::Buy, 10, 5), &mut b, TS).unwrap();
+        let second = ob.submit(&limit(2, Side::Buy, 10, 5), &mut b, TS).unwrap();
+        b.clear();
+        ob.submit(
+            &NewOrder::market(ClientOrderId(3), Side::Sell, 5),
+            &mut b,
+            TS,
+        )
+        .unwrap();
+        assert_eq!(b.as_slice()[0].bid_order_id, first);
+        assert!(ob.get(first).is_none());
+        assert_eq!(ob.get(second).unwrap().remaining_qty, 5);
+    }
+
+    #[test]
+    fn best_prices_across_multiple_levels() {
+        let (mut ob, mut b) = (book(), buf());
+        for (i, (side, price, qty)) in [
+            (Side::Buy, 9, 10),
+            (Side::Buy, 8, 5),
+            (Side::Buy, 7, 3),
+            (Side::Sell, 10, 10),
+            (Side::Sell, 11, 5),
+            (Side::Sell, 12, 3),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            test_ob.add_order(&limit_order).unwrap();
+            b.clear();
+            ob.submit(&limit(i as u64, side, price, qty), &mut b, TS)
+                .unwrap();
         }
-        // Market Order arrives later to consume the OB
-        let trades = test_ob.add_order(&market_order).unwrap();
-        let first_trade = trades.first().unwrap();
-        assert_eq!(first_trade.price, 10);
-        assert_eq!(first_trade.quantity, 10);
-        assert_eq!(trades.len(), 1);
+        assert_eq!(ob.get_best_bid(), Some(9));
+        assert_eq!(ob.get_best_ask(), Some(10));
+        assert_eq!(ob.level_count(), 6);
     }
 
     #[test]
-    fn check_get_best_bid_ask_in_multiple_limit_orders() {
-        let mut test_ob = OrderBook::new();
-        {
-            let buy_order_1 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 9, 10));
-            let buy_order_2 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 8, 5));
-            let buy_order_3 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 7, 3));
-
-            test_ob.add_order(&buy_order_1).unwrap();
-            test_ob.add_order(&buy_order_2).unwrap();
-            test_ob.add_order(&buy_order_3).unwrap();
+    fn market_order_walks_multiple_levels_best_first() {
+        let (mut ob, mut b) = (book(), buf());
+        for (i, (price, qty)) in [(9, 3), (8, 5), (7, 10)].into_iter().enumerate() {
+            b.clear();
+            ob.submit(&limit(i as u64, Side::Buy, price, qty), &mut b, TS)
+                .unwrap();
         }
+        b.clear();
+        ob.submit(
+            &NewOrder::market(ClientOrderId(9), Side::Sell, 10),
+            &mut b,
+            TS,
+        )
+        .unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!(b.as_slice()[0].price, 9);
+        assert_eq!(b.as_slice()[1].price, 8);
+        assert_eq!(b.as_slice()[2].price, 7);
+        assert_eq!(
+            b.as_slice().iter().map(|t| t.quantity).sum::<Quantity>(),
+            10
+        );
+    }
 
-        {
-            let sell_order_1 = Arc::new(Order::new(OrderType::LimitOrder, Side::Sell, 10, 10));
-            let sell_order_2 = Arc::new(Order::new(OrderType::LimitOrder, Side::Sell, 11, 5));
-            let sell_order_3 = Arc::new(Order::new(OrderType::LimitOrder, Side::Sell, 12, 3));
+    #[test]
+    fn cancel_sell_order() {
+        let (mut ob, mut b) = (book(), buf());
+        let id = ob
+            .submit(&limit(1, Side::Sell, 100, 5), &mut b, TS)
+            .unwrap();
+        ob.cancel(id).unwrap();
+        assert_eq!(ob.get_best_ask(), None);
+        assert_eq!(ob.live_orders(), 0);
+        assert_eq!(ob.level_count(), 0);
+    }
 
-            test_ob.add_order(&sell_order_1).unwrap();
-            test_ob.add_order(&sell_order_2).unwrap();
-            test_ob.add_order(&sell_order_3).unwrap();
+    #[test]
+    fn cancel_after_partial_fill() {
+        let (mut ob, mut b) = (book(), buf());
+        let resting = ob
+            .submit(&limit(1, Side::Buy, 100, 10), &mut b, TS)
+            .unwrap();
+        b.clear();
+        ob.submit(
+            &NewOrder::market(ClientOrderId(2), Side::Sell, 4),
+            &mut b,
+            TS,
+        )
+        .unwrap();
+        assert_eq!(ob.get(resting).unwrap().remaining_qty, 6);
+        assert_eq!(ob.get(resting).unwrap().executed_qty(), 4);
+        assert_eq!(ob.best_bid_level().unwrap().volume, 6);
+        ob.cancel(resting).unwrap();
+        assert_eq!(ob.get_best_bid(), None);
+        assert!(ob.get(resting).is_none());
+    }
+
+    #[test]
+    fn stale_order_id_is_rejected_not_dereferenced() {
+        let (mut ob, mut b) = (book(), buf());
+        let old = ob.submit(&limit(1, Side::Buy, 100, 5), &mut b, TS).unwrap();
+        ob.cancel(old).unwrap();
+        assert_eq!(
+            ob.cancel(old),
+            Err(OrderBookError::OrderNotFound { order_id: old })
+        );
+        b.clear();
+        let new = ob.submit(&limit(2, Side::Buy, 100, 5), &mut b, TS).unwrap();
+        assert_eq!(new.slot(), old.slot());
+        assert_ne!(new, old);
+        assert!(ob.get(old).is_none());
+    }
+
+    #[test]
+    fn fok_fills_when_liquidity_exactly_matches() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Sell, 100, 10), &mut b, TS)
+            .unwrap();
+        b.clear();
+        let fok = NewOrder {
+            client_order_id: ClientOrderId(2),
+            order_type: OrderType::FillOrKill,
+            side: Side::Buy,
+            price: 100,
+            quantity: 10,
+        };
+        ob.submit(&fok, &mut b, TS).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.as_slice()[0].quantity, 10);
+    }
+
+    #[test]
+    fn fok_is_killed_when_liquidity_insufficient() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Sell, 100, 5), &mut b, TS)
+            .unwrap();
+        b.clear();
+        let fok = NewOrder {
+            client_order_id: ClientOrderId(2),
+            order_type: OrderType::FillOrKill,
+            side: Side::Buy,
+            price: 100,
+            quantity: 10,
+        };
+        let id = ob.submit(&fok, &mut b, TS).unwrap();
+        assert!(b.is_empty());
+        assert_eq!(ob.get_best_ask(), Some(100));
+        assert!(ob.get(id).is_none());
+    }
+
+    #[test]
+    fn fok_sell_side_uses_the_bid_ladder() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Buy, 100, 6), &mut b, TS).unwrap();
+        ob.submit(&limit(2, Side::Buy, 99, 6), &mut b, TS).unwrap();
+        b.clear();
+        // limit 99 -> 兩個價位都夠得着，總量 12 >= 10
+        let fok = NewOrder {
+            client_order_id: ClientOrderId(3),
+            order_type: OrderType::FillOrKill,
+            side: Side::Sell,
+            price: 99,
+            quantity: 10,
+        };
+        ob.submit(&fok, &mut b, TS).unwrap();
+        assert_eq!(
+            b.as_slice().iter().map(|t| t.quantity).sum::<Quantity>(),
+            10
+        );
+        assert_eq!(b.as_slice()[0].price, 100); // 由最好價開始
+    }
+
+    #[test]
+    fn ioc_takes_what_it_can_and_does_not_rest() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Sell, 100, 4), &mut b, TS)
+            .unwrap();
+        b.clear();
+        let ioc = NewOrder {
+            client_order_id: ClientOrderId(2),
+            order_type: OrderType::ImmediateOrCancel,
+            side: Side::Buy,
+            price: 100,
+            quantity: 10,
+        };
+        ob.submit(&ioc, &mut b, TS).unwrap();
+        assert_eq!(b.as_slice()[0].quantity, 4);
+        assert_eq!(ob.get_best_bid(), None);
+        assert_eq!(ob.live_orders(), 0);
+    }
+
+    #[test]
+    fn negative_prices_work() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Buy, -37, 5), &mut b, TS).unwrap();
+        assert_eq!(ob.get_best_bid(), Some(-37));
+        b.clear();
+        ob.submit(
+            &NewOrder::market(ClientOrderId(2), Side::Sell, 5),
+            &mut b,
+            TS,
+        )
+        .unwrap();
+        assert_eq!(b.as_slice()[0].price, -37);
+    }
+
+    #[test]
+    fn price_outside_band_is_rejected_before_touching_the_arena() {
+        let (mut ob, mut b) = (book(), buf());
+        assert_eq!(
+            ob.submit(&limit(1, Side::Buy, 100_000, 1), &mut b, TS),
+            Err(OrderBookError::PriceNotOnLadder { price: 100_000 })
+        );
+        assert_eq!(ob.live_orders(), 0);
+        assert_eq!(ob.get(OrderId::new(0, 1)), None);
+    }
+
+    #[test]
+    fn off_tick_price_is_rejected() {
+        let mut ob = OrderBook::with_config(BookConfig {
+            max_orders: 16,
+            base_price: 1000,
+            tick_size: 25,
+            num_ticks: 100,
+        });
+        let mut b = buf();
+        assert!(ob.submit(&limit(1, Side::Buy, 1025, 1), &mut b, TS).is_ok());
+        assert_eq!(
+            ob.submit(&limit(2, Side::Buy, 1010, 1), &mut b, TS),
+            Err(OrderBookError::PriceNotOnLadder { price: 1010 })
+        );
+    }
+
+    #[test]
+    fn arena_full_is_backpressure_not_growth() {
+        let mut ob = OrderBook::with_config(BookConfig {
+            max_orders: 2,
+            base_price: 0,
+            tick_size: 1,
+            num_ticks: 64,
+        });
+        let mut b = buf();
+        ob.submit(&limit(1, Side::Buy, 10, 1), &mut b, TS).unwrap();
+        ob.submit(&limit(2, Side::Buy, 11, 1), &mut b, TS).unwrap();
+        assert_eq!(
+            ob.submit(&limit(3, Side::Buy, 12, 1), &mut b, TS),
+            Err(OrderBookError::BookFull)
+        );
+    }
+
+    #[test]
+    fn depth_snapshot_needs_no_allocation() {
+        let (mut ob, mut b) = (book(), buf());
+        for (i, price) in [9, 8, 7, 6].into_iter().enumerate() {
+            b.clear();
+            ob.submit(&limit(i as u64, Side::Buy, price, 10), &mut b, TS)
+                .unwrap();
         }
-        assert_eq!(test_ob.get_best_bid().unwrap(), 9);
-        assert_eq!(test_ob.get_best_ask().unwrap(), 10);
+        let mut depth = [LevelInfo {
+            price: 0,
+            volume: 0,
+            order_count: 0,
+        }; 3];
+        let n = ob.bid_depth(&mut depth);
+        assert_eq!(n, 3);
+        assert_eq!(depth[0].price, 9);
+        assert_eq!(depth[1].price, 8);
+        assert_eq!(depth[2].price, 7);
     }
 
     #[test]
-    fn check_add_multiples_limit_order_and_later_comsumed_by_an_market_order() {
-        let mut test_ob = OrderBook::new();
-        let market_order = Arc::new(Order::new(OrderType::MarketOrder, Side::Sell, 0, 10));
-
-        // limit order first arrives to the OB
-        {
-            let buy_order_1 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 9, 3));
-            let buy_order_2 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 8, 5));
-            let buy_order_3 = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 7, 10));
-
-            test_ob.add_order(&buy_order_1).unwrap();
-            test_ob.add_order(&buy_order_2).unwrap();
-            test_ob.add_order(&buy_order_3).unwrap();
+    fn churn_does_not_leak_levels_or_slots() {
+        let (mut ob, mut b) = (book(), buf());
+        for i in 0..5000u64 {
+            b.clear();
+            let id = ob
+                .submit(&limit(i, Side::Buy, (i % 8) as Price, 1), &mut b, TS)
+                .unwrap();
+            ob.cancel(id).unwrap();
         }
-        // Market Order arrives later to consume the OB
-        let trades = test_ob.add_order(&market_order).unwrap();
-        assert_eq!(trades.len(), 3);
+        assert_eq!(ob.level_count(), 0);
+        assert_eq!(ob.live_orders(), 0);
+        assert_eq!(ob.get_best_bid(), None);
     }
 
     #[test]
-    fn market_order_never_rests_unfilled_quantity() {
-        let mut book = OrderBook::new();
-        let market_order = order(1, OrderType::MarketOrder, Side::Buy, 0, 10);
-
-        assert!(book.add_order(&market_order).unwrap().is_empty());
-        assert_eq!(book.resting_order_count(), 0);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    #[test]
-    fn ioc_executes_available_quantity_and_never_rests_the_remainder() {
-        let mut book = OrderBook::new();
-        let ask = order(1, OrderType::GoodTillCancel, Side::Sell, 100, 5);
-        let ioc = order(2, OrderType::ImmediateOrCancel, Side::Buy, 101, 10);
-        book.add_order(&ask).unwrap();
-
-        let trades = book.add_order(&ioc).unwrap();
-
-        assert_eq!(trades.len(), 1);
-        assert_eq!(trades[0].quantity, 5);
-        assert_eq!(trades[0].bid_order_id, ioc.order_id);
-        assert_eq!(trades[0].ask_order_id, ask.order_id);
-        assert_eq!(book.resting_order_count(), 0);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    #[test]
-    fn fok_executes_when_exact_quantity_is_available() {
-        let mut book = OrderBook::new();
-        let ask = order(1, OrderType::GoodTillCancel, Side::Sell, 100, 10);
-        let fok = order(2, OrderType::FillOrKill, Side::Buy, 100, 10);
-        book.add_order(&ask).unwrap();
-
-        let trades = book.add_order(&fok).unwrap();
-
-        assert_eq!(trades.iter().map(|trade| trade.quantity).sum::<u64>(), 10);
-        assert_eq!(book.resting_order_count(), 0);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    #[test]
-    fn fok_is_atomic_when_compatible_liquidity_is_insufficient() {
-        let mut book = OrderBook::new();
-        let ask_at_limit = order(1, OrderType::GoodTillCancel, Side::Sell, 100, 5);
-        let ask_above_limit = order(2, OrderType::GoodTillCancel, Side::Sell, 101, 5);
-        let fok = order(3, OrderType::FillOrKill, Side::Buy, 100, 6);
-        book.add_order(&ask_at_limit).unwrap();
-        book.add_order(&ask_above_limit).unwrap();
-
-        assert!(book.add_order(&fok).unwrap().is_empty());
-        assert_eq!(book.resting_order_count(), 2);
-        assert_eq!(book.total_resting_quantity(), 10);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    #[test]
-    fn matching_preserves_fifo_within_a_price_level() {
-        let mut book = OrderBook::new();
-        let first_ask = order(1, OrderType::GoodTillCancel, Side::Sell, 100, 5);
-        let second_ask = order(2, OrderType::GoodTillCancel, Side::Sell, 100, 5);
-        let ioc = order(3, OrderType::ImmediateOrCancel, Side::Buy, 100, 6);
-        book.add_order(&first_ask).unwrap();
-        book.add_order(&second_ask).unwrap();
-
-        let trades = book.add_order(&ioc).unwrap();
-
-        assert_eq!(trades.len(), 2);
-        assert_eq!(trades[0].ask_order_id, first_ask.order_id);
-        assert_eq!(trades[0].quantity, 5);
-        assert_eq!(trades[1].ask_order_id, second_ask.order_id);
-        assert_eq!(trades[1].quantity, 1);
-        assert_eq!(book.total_resting_quantity(), 4);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    #[test]
-    fn cancel_sell_removes_ask_level() {
-        let mut book = OrderBook::new();
-        let ask = order(1, OrderType::GoodTillCancel, Side::Sell, 100, 10);
-        book.add_order(&ask).unwrap();
-
-        book.cancel_order(ask.order_id).unwrap();
-
-        assert_eq!(book.get_best_ask(), None);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    #[test]
-    fn partial_fill_updates_pointer_before_cancel() {
-        let mut book = OrderBook::new();
-        let ask = order(1, OrderType::GoodTillCancel, Side::Sell, 100, 10);
-        let ioc = order(2, OrderType::ImmediateOrCancel, Side::Buy, 100, 4);
-        book.add_order(&ask).unwrap();
-        book.add_order(&ioc).unwrap();
-        assert_eq!(book.total_resting_quantity(), 6);
-        assert!(book.validate_invariants().is_ok());
-
-        book.cancel_order(ask.order_id).unwrap();
-
-        assert_eq!(book.resting_order_count(), 0);
-        assert!(book.validate_invariants().is_ok());
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
-
-        #[test]
-        fn random_operation_sequences_preserve_invariants(
-            operations in prop::collection::vec(
-                (0u8..6, any::<bool>(), 95i64..106, 1u64..25, 0usize..512),
-                1..256,
-            )
-        ) {
-            let mut book = OrderBook::new();
-            let mut submitted_ids = Vec::new();
-
-            for (step, (operation, buy, price, quantity, selector)) in
-                operations.into_iter().enumerate()
-            {
-                if operation == 0 && !submitted_ids.is_empty() {
-                    let id = submitted_ids[selector % submitted_ids.len()];
-                    let _ = book.cancel_order(id);
-                } else {
-                    let side = if buy { Side::Buy } else { Side::Sell };
-                    let order_type = match operation {
-                        2 => OrderType::ImmediateOrCancel,
-                        3 => OrderType::FillOrKill,
-                        4 => OrderType::MarketOrder,
-                        _ => OrderType::GoodTillCancel,
-                    };
-                    let order = order(
-                        step as u128 + 1,
-                        order_type,
-                        side,
-                        if order_type == OrderType::MarketOrder { 0 } else { price },
-                        quantity,
-                    );
-                    submitted_ids.push(order.order_id);
-                    prop_assert!(book.add_order(&order).is_ok());
-                }
-
-                prop_assert!(
-                    book.validate_invariants().is_ok(),
-                    "invariant failure after step {step}: {:?}",
-                    book.validate_invariants()
-                );
-            }
-        }
+    fn trade_ids_are_monotonic() {
+        let (mut ob, mut b) = (book(), buf());
+        ob.submit(&limit(1, Side::Sell, 100, 1), &mut b, TS)
+            .unwrap();
+        ob.submit(&limit(2, Side::Sell, 101, 1), &mut b, TS)
+            .unwrap();
+        b.clear();
+        ob.submit(
+            &NewOrder::market(ClientOrderId(3), Side::Buy, 2),
+            &mut b,
+            TS,
+        )
+        .unwrap();
+        assert_eq!(b.as_slice()[0].trade_id, TradeId(1));
+        assert_eq!(b.as_slice()[1].trade_id, TradeId(2));
     }
 }

@@ -1,15 +1,42 @@
-use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use orderbook::orderbook::order::{Order, OrderType, Side};
-use orderbook::orderbook::orderbook_impl::OrderBook;
+use orderbook::{ClientOrderId, NewOrder, OrderBook, Side, TradeBuf};
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
 
 fn main() {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    // 所有 allocation 喺呢三行發生
+    let mut book = OrderBook::new();
+    let report = book.warm_up();
+    let mut trades = TradeBuf::default();
+    println!("warm-up: {report:?}");
 
-    let mut test_ob = OrderBook::new();
-    let limit_order = Arc::new(Order::new(OrderType::LimitOrder, Side::Buy, 10, 10));
-    let trades = test_ob.add_order(&limit_order).unwrap();
-    println!("trades {:?}", trades);
+    trades.clear();
+    let maker_id = book
+        .submit(
+            &NewOrder::limit(ClientOrderId(1), Side::Buy, 10, 10),
+            &mut trades,
+            now_ns(),
+        )
+        .unwrap();
+    println!("resting order {maker_id}");
+
+    trades.clear();
+    book.submit(
+        &NewOrder::market(ClientOrderId(2), Side::Sell, 4),
+        &mut trades,
+        now_ns(),
+    )
+    .unwrap();
+    println!("trades: {:?}", trades.as_slice());
+    println!(
+        "resting remaining: {:?}",
+        book.get(maker_id).map(|s| s.remaining_qty)
+    );
+    println!("best bid: {:?}", book.get_best_bid());
 }

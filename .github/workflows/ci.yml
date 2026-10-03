@@ -1,34 +1,89 @@
-name: CI
+name: CI and Release
 
 on:
   push:
+    branches: [main, 'codex/**']
   pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6
         with:
-          components: rustfmt, clippy
-      - name: Check formatting
+          persist-credentials: false
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.96.0
+      - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Debug tests
+        run: cargo test --locked --all-targets
+      - name: Release tests
+        run: cargo test --locked --release --all-targets
 
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@v6
         with:
-          components: miri, rust-src
-      - name: Set up Miri
-        run: cargo miri setup
-      - name: Check raw-pointer lifecycle
+          persist-credentials: false
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri,rust-src
+          cargo +nightly miri setup
+      - name: Check typed page touches, including struct padding
+        run: cargo +nightly miri test --locked --lib prefault
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [test, miri]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build and package Linux binaries
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo +1.96.0 build --locked --release --bins
+          mkdir -p dist/orderbook-linux-x86_64
+          cp target/release/{main,benchmark,latency} README.md dist/orderbook-linux-x86_64/
+          printf '%s\n' "$GITHUB_SHA" > dist/orderbook-linux-x86_64/COMMIT
+          tar -C dist -czf dist/orderbook-linux-x86_64.tar.gz orderbook-linux-x86_64
+          cd dist
+          sha256sum orderbook-linux-x86_64.tar.gz > SHA256SUMS
+      - name: Publish development release
         env:
-          MIRIFLAGS: -Zmiri-disable-isolation
-        run: cargo miri test --lib partial_fill_updates_pointer_before_cancel
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="build-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/orderbook-linux-x86_64.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" dist/orderbook-linux-x86_64.tar.gz dist/SHA256SUMS \
+              --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Development build ${GITHUB_SHA:0:12}" \
+              --notes "Tested Linux x86_64 binaries for $GITHUB_SHA. This is a library/demo build, not a hosted trading service."
+          fi
