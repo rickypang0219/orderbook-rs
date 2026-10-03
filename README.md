@@ -96,3 +96,13 @@ Memory locking / huge-page advice is best-effort; inspect the returned `MemRepor
 Order-state bitmaps, cached best prices and dirty-level feeds are deferred until
 profiling or an actual consumer justifies their additional state. Packing flags
 alone would not shrink the currently 64-byte-aligned order slots.
+
+## Automated releases
+
+Pull requests run formatting, Clippy and debug/release tests on Linux and macOS.
+Miri checks the remaining typed page-touch code, including padded structs.
+After all checks pass on `main`, GitHub Actions publishes a development prerelease
+containing Linux x86_64 `main`, `benchmark` and `latency` binaries, the source commit,
+and a SHA-256 checksum. The `main` executable is a demonstration, not a server.
+Releases use GitHub's built-in token; no deployment credentials are required.
+This publishes downloadable builds, not a running exchange or a crates.io package.

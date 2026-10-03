@@ -2,7 +2,7 @@
 //! 亦唔再 hold `price` —— 價格由 ladder 嘅 tick 推導出嚟。
 
 use crate::orderbook::arena::OrderArena;
-use crate::orderbook::types::{Price, Quantity, NIL};
+use crate::orderbook::types::{NIL, Price, Quantity};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

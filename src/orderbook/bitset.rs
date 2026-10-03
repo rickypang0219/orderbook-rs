@@ -237,7 +237,9 @@ mod tests {
         // 一個確定性偽隨機序列，唔使引入 rand 依賴
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
         for _ in 0..N {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let i = (state >> 33) as usize % N;
             if naive.0[i] {
                 b.remove(i);

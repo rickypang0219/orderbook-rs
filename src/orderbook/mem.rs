@@ -119,6 +119,22 @@ mod tests {
     }
 
     #[test]
+    fn prefault_preserves_padded_values() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        #[repr(C)]
+        struct Padded {
+            tag: u8,
+            value: u64,
+        }
+        let mut values = [Padded { tag: 7, value: 42 }; 300];
+        let bytes = prefault(&mut values);
+        assert_eq!(bytes, core::mem::size_of_val(&values));
+        assert!(values.iter().all(|v| *v == Padded { tag: 7, value: 42 }));
+        assert_eq!(prefault(&mut [(); 2]), 0);
+        assert_eq!(prefault::<u64>(&mut []), 0);
+    }
+
+    #[test]
     fn warm_does_not_corrupt_data() {
         let mut v: Vec<u32> = (0..5_000).collect();
         let r = warm(&mut v);
