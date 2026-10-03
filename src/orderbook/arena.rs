@@ -9,7 +9,7 @@
 //! 郁一個 `u32` free-list head。滿咗係 `None`（backpressure），唔會 grow。
 
 use crate::orderbook::order::{OrderType, Side, Status};
-use crate::orderbook::types::{ClientOrderId, OrderId, Price, Quantity, NIL};
+use crate::orderbook::types::{ClientOrderId, NIL, OrderId, Price, Quantity};
 
 /// 一張單。刻意砌到啱啱 64 bytes = 一條 cache line。
 ///
@@ -40,6 +40,7 @@ pub struct OrderSlot {
     pub level: u32,
 
     pub price: Price,
+    /// Accepted total quantity, adjusted by amendments; executed = total - remaining.
     pub original_qty: Quantity,
     pub remaining_qty: Quantity,
     pub client_order_id: ClientOrderId,
@@ -126,7 +127,11 @@ impl OrderArena {
 
         let mut slots = vec![OrderSlot::EMPTY; capacity];
         for (i, s) in slots.iter_mut().enumerate() {
-            s.next = if i + 1 < capacity { (i + 1) as u32 } else { NIL };
+            s.next = if i + 1 < capacity {
+                (i + 1) as u32
+            } else {
+                NIL
+            };
         }
 
         OrderArena {
@@ -174,8 +179,7 @@ impl OrderArena {
 
     /// 還一個 slot。generation 遞增，所有仲揸住舊 `OrderId` 嘅人自動失效。
     ///
-    /// 注意 generation 用 `wrapping_add`：理論上 2^32 次重用之後會 ABA。
-    /// 以 1M orders/sec 計，同一個 slot 要重用 2^32 次大約要幾十年。
+    /// Exhausted generations retire the slot permanently; stale IDs never revive.
     pub fn free(&mut self, id: OrderId) -> bool {
         let Some(s) = self.slots.get_mut(id.slot() as usize) else {
             return false;
@@ -184,11 +188,15 @@ impl OrderArena {
             return false;
         }
         s.in_use = false;
-        s.generation = s.generation.wrapping_add(1);
         s.level = NIL;
         s.prev = NIL;
-        s.next = self.free_head;
-        self.free_head = id.slot();
+        if let Some(generation) = s.generation.checked_add(1) {
+            s.generation = generation;
+            s.next = self.free_head;
+            self.free_head = id.slot();
+        } else {
+            s.next = NIL;
+        }
         self.live -= 1;
         true
     }
@@ -314,6 +322,18 @@ mod tests {
         assert!(a.alloc(sample()).is_some());
         assert!(a.alloc(sample()).is_some());
         assert!(a.alloc(sample()).is_none());
+    }
+
+    #[test]
+    fn exhausted_generation_retires_slot() {
+        let mut arena = OrderArena::with_capacity(1);
+        arena.slots[0].generation = u32::MAX;
+        let id = arena.alloc(sample()).unwrap();
+        assert!(arena.free(id));
+        assert!(arena.get(id).is_none());
+        assert_eq!(arena.live(), 0);
+        assert!(arena.is_full());
+        assert!(arena.alloc(sample()).is_none());
     }
 
     #[test]

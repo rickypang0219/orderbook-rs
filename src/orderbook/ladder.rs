@@ -13,12 +13,14 @@
 
 use crate::orderbook::arena::OrderArena;
 use crate::orderbook::bitset::HierBitset;
+use crate::orderbook::order::Side;
 use crate::orderbook::price_level::{self, LevelInfo, PriceLevel};
-use crate::orderbook::types::{Price, Quantity};
+use crate::orderbook::types::{NIL, Price, Quantity};
 
 pub struct Ladder {
     base_price: Price,
     tick_size: Price,
+    max_price: Price,
     levels: Box<[PriceLevel]>,
     occupancy: HierBitset,
     live_levels: u32,
@@ -27,10 +29,19 @@ pub struct Ladder {
 impl Ladder {
     pub fn new(base_price: Price, tick_size: Price, num_ticks: usize) -> Self {
         assert!(tick_size > 0, "tick_size must be positive");
-        assert!(num_ticks > 0, "num_ticks must be positive");
+        assert!(
+            num_ticks > 0 && num_ticks < NIL as usize,
+            "invalid tick count"
+        );
+        // Limit the span to i64 so hot-path price differences cannot overflow.
+        let span = tick_size
+            .checked_mul((num_ticks - 1) as i64)
+            .expect("price span overflow");
+        let max_price = base_price.checked_add(span).expect("price band overflow");
         Ladder {
             base_price,
             tick_size,
+            max_price,
             levels: vec![PriceLevel::EMPTY; num_ticks].into_boxed_slice(),
             occupancy: HierBitset::with_capacity(num_ticks),
             live_levels: 0,
@@ -54,13 +65,13 @@ impl Ladder {
 
     #[inline(always)]
     pub fn max_price(&self) -> Price {
-        self.base_price + (self.levels.len() as Price - 1) * self.tick_size
+        self.max_price
     }
 
     /// 精確落格嘅價 -> tick。唔喺 grid 上或者出 band 都返 `None`。
     #[inline]
     pub fn tick_of(&self, price: Price) -> Option<u32> {
-        if price < self.base_price {
+        if price < self.base_price || price > self.max_price {
             return None;
         }
         let d = price - self.base_price;
@@ -82,7 +93,7 @@ impl Ladder {
         if price < self.base_price {
             return None;
         }
-        let t = (price - self.base_price) / self.tick_size;
+        let t = (price.min(self.max_price) - self.base_price) / self.tick_size;
         Some(t.min(self.levels.len() as Price - 1) as u32)
     }
 
@@ -91,6 +102,9 @@ impl Ladder {
     pub fn tick_ceil(&self, price: Price) -> Option<u32> {
         if price <= self.base_price {
             return Some(0);
+        }
+        if price > self.max_price {
+            return None;
         }
         let d = price - self.base_price;
         let t = d.div_euclid(self.tick_size) + i64::from(d % self.tick_size != 0);
@@ -113,12 +127,32 @@ impl Ladder {
 
     #[inline]
     pub fn next_occupied_above(&self, tick: u32) -> Option<u32> {
-        self.occupancy.next_at_or_above(tick as usize).map(|t| t as u32)
+        self.occupancy
+            .next_at_or_above(tick as usize)
+            .map(|t| t as u32)
     }
 
     #[inline]
     pub fn next_occupied_below(&self, tick: u32) -> Option<u32> {
-        self.occupancy.next_at_or_below(tick as usize).map(|t| t as u32)
+        self.occupancy
+            .next_at_or_below(tick as usize)
+            .map(|t| t as u32)
+    }
+
+    pub(crate) fn best_tick(&self, side: Side) -> Option<u32> {
+        match side {
+            Side::Buy => self.highest_tick(),
+            Side::Sell => self.lowest_tick(),
+        }
+    }
+
+    pub(crate) fn next_tick(&self, side: Side, tick: u32) -> Option<u32> {
+        match side {
+            Side::Buy => tick
+                .checked_sub(1)
+                .and_then(|t| self.next_occupied_below(t)),
+            Side::Sell => self.next_occupied_above(tick + 1),
+        }
     }
 
     // ----------------------------------------------------------------- access
@@ -191,7 +225,7 @@ impl Ladder {
         self.levels[tick as usize] = PriceLevel::EMPTY;
     }
 
-    /// 由 `lo` 到 `hi`（含兩端）加總所有 occupied level 嘅 volume。零 allocation。
+    /// Sum occupied levels, saturating at Quantity::MAX. Zero allocation.
     pub fn volume_between(&self, lo: u32, hi: u32) -> Quantity {
         if lo > hi {
             return 0;
@@ -202,7 +236,7 @@ impl Ladder {
             if t > hi as usize {
                 break;
             }
-            total += self.levels[t].volume;
+            total = total.saturating_add(self.levels[t].volume);
             cur = self.occupancy.next_at_or_above(t + 1);
         }
         total
@@ -222,7 +256,31 @@ mod tests {
     }
 
     fn slot(qty: Quantity) -> OrderSlot {
-        OrderSlot::incoming(ClientOrderId(0), OrderType::LimitOrder, Side::Buy, 0, qty, 0)
+        OrderSlot::incoming(
+            ClientOrderId(0),
+            OrderType::LimitOrder,
+            Side::Buy,
+            0,
+            qty,
+            0,
+        )
+    }
+
+    #[test]
+    fn extreme_prices_are_rejected_or_clamped_without_overflow() {
+        let l = Ladder::new(i64::MIN, 1, 2);
+        assert_eq!(l.tick_of(i64::MAX), None);
+        assert_eq!(l.tick_floor(i64::MAX), Some(1));
+        assert_eq!(l.tick_ceil(i64::MAX), None);
+        let l = Ladder::new(i64::MAX - 1, 1, 2);
+        assert_eq!(l.price_of(1), i64::MAX);
+        assert_eq!(l.tick_of(i64::MIN), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "price band overflow")]
+    fn invalid_band_is_rejected_before_allocation() {
+        Ladder::new(i64::MAX, 1, 2);
     }
 
     #[test]

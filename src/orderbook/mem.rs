@@ -38,68 +38,63 @@ pub struct MemReport {
     pub hugepage_advised: bool,
 }
 
-#[inline]
-fn as_bytes_mut<T>(buf: &mut [T]) -> &mut [u8] {
-    let len = core::mem::size_of_val(buf);
-    // SAFETY: 只係當成 byte 睇同一段記憶體，長度用 size_of_val 算，冇越界。
-    unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, len) }
-}
-
-/// 逐頁做一次 read-modify-write（寫返原值），強制 page fault in。
-/// 用 volatile 防止 optimizer 當成 no-op 消走。
-///
-/// Stride 用 4 KiB：喺 16 KiB page 嘅平台（Apple Silicon）會多寫幾次，
-/// 但一定唔會漏頁。行一次 init 而已，唔值得為咗慳幾條 store 而去
-/// `sysconf(_SC_PAGESIZE)`。
-pub fn prefault<T>(buf: &mut [T]) -> usize {
-    let bytes = as_bytes_mut(buf);
-    let len = bytes.len();
-    let ptr = bytes.as_mut_ptr();
-    let mut off = 0usize;
-    while off < len {
-        // SAFETY: off < len，指標喺 buffer 內。
-        unsafe {
-            let p = ptr.add(off);
-            let v = core::ptr::read_volatile(p);
-            core::ptr::write_volatile(p, v);
-        }
-        off += 4096;
+/// Touch initialized values at roughly 4 KiB intervals before serving traffic.
+/// Typed copies avoid interpreting struct padding as initialized bytes.
+/// See https://doc.rust-lang.org/std/ptr/fn.read_volatile.html#safety
+pub fn prefault<T: Copy>(buf: &mut [T]) -> usize {
+    let size = core::mem::size_of::<T>();
+    if size == 0 {
+        return 0;
     }
-    len
+    let stride = (4096 / size).max(1);
+    // The last element also touches a trailing page when the allocation is unaligned.
+    let indices = (0..buf.len())
+        .step_by(stride)
+        .chain(buf.len().checked_sub(1));
+    for i in indices {
+        let value = &mut buf[i];
+        // SAFETY: value is aligned, initialized and exclusively borrowed.
+        // T: Copy prevents duplicate ownership. Volatile keeps the OS page touch
+        // from being optimized away; this is startup work, not a hot-path shortcut.
+        unsafe {
+            core::ptr::write_volatile(value, core::ptr::read_volatile(value));
+        }
+    }
+    core::mem::size_of_val(buf)
 }
 
 /// 釘住頁面（需要 `RLIMIT_MEMLOCK`；唔夠權限會失敗，返 false）。
 pub fn lock<T>(buf: &mut [T]) -> bool {
-    let bytes = as_bytes_mut(buf);
+    let len = core::mem::size_of_val(buf);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // SAFETY: 指標同長度嚟自一個有效 slice。
-        unsafe { mlock(bytes.as_ptr() as *const c_void, bytes.len()) == 0 }
+        unsafe { mlock(buf.as_ptr() as *const c_void, len) == 0 }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = bytes;
+        let _ = len;
         false
     }
 }
 
 /// 建議 kernel 用 transparent huge page。
 pub fn advise_hugepage<T>(buf: &mut [T]) -> bool {
-    let bytes = as_bytes_mut(buf);
+    let len = core::mem::size_of_val(buf);
     #[cfg(target_os = "linux")]
     {
         // SAFETY: 同上。madvise 失敗只係冇 hugepage，唔影響正確性。
-        unsafe { madvise(bytes.as_mut_ptr() as *mut c_void, bytes.len(), MADV_HUGEPAGE) == 0 }
+        unsafe { madvise(buf.as_mut_ptr() as *mut c_void, len, MADV_HUGEPAGE) == 0 }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = bytes;
+        let _ = len;
         false
     }
 }
 
 /// 一次過做齊三樣。
-pub fn warm<T>(buf: &mut [T]) -> MemReport {
+pub fn warm<T: Copy>(buf: &mut [T]) -> MemReport {
     let hugepage_advised = advise_hugepage(buf);
     let bytes_prefaulted = prefault(buf);
     let locked = lock(buf);

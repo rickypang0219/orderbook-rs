@@ -8,7 +8,9 @@
 //! `--test-threads=1`。呢個 file 入面有個 test 專門守住呢件事。
 
 use orderbook::alloc_guard;
-use orderbook::{BookConfig, ClientOrderId, LevelInfo, NewOrder, OrderBook, OrderId, Side, TradeBuf};
+use orderbook::{
+    BookConfig, ClientOrderId, LevelInfo, NewOrder, OrderBook, OrderId, Side, TradeBuf,
+};
 
 #[global_allocator]
 static ALLOC: alloc_guard::Counting = alloc_guard::Counting;
@@ -93,7 +95,10 @@ fn matching_allocates_nothing() {
     }
     let (allocs, bytes) = alloc_guard::disarm();
 
-    assert_eq!(allocs, 0, "matching allocated {allocs} times ({bytes} bytes)");
+    assert_eq!(
+        allocs, 0,
+        "matching allocated {allocs} times ({bytes} bytes)"
+    );
 }
 
 #[test]
@@ -109,7 +114,11 @@ fn queries_and_depth_snapshots_allocate_nothing() {
         )
         .unwrap();
     }
-    let mut depth = [LevelInfo { price: 0, volume: 0, order_count: 0 }; 20];
+    let mut depth = [LevelInfo {
+        price: 0,
+        volume: 0,
+        order_count: 0,
+    }; 20];
 
     alloc_guard::arm();
     let mut acc = 0i64;
@@ -121,7 +130,10 @@ fn queries_and_depth_snapshots_allocate_nothing() {
     let (allocs, bytes) = alloc_guard::disarm();
     std::hint::black_box(acc);
 
-    assert_eq!(allocs, 0, "queries allocated {allocs} times ({bytes} bytes)");
+    assert_eq!(
+        allocs, 0,
+        "queries allocated {allocs} times ({bytes} bytes)"
+    );
 }
 
 #[test]
@@ -133,13 +145,28 @@ fn rejects_allocate_nothing() {
     for i in 0..10_000u64 {
         trades.clear();
         // 出 band、零數量、arena 滿 —— 三條 reject 路徑
-        let _ = ob.submit(&NewOrder::limit(ClientOrderId(i), Side::Buy, 999_999, 1), &mut trades, TS);
-        let _ = ob.submit(&NewOrder::limit(ClientOrderId(i), Side::Buy, 100, 0), &mut trades, TS);
-        let _ = ob.submit(&NewOrder::limit(ClientOrderId(i), Side::Buy, 100, 1), &mut trades, TS);
+        let _ = ob.submit(
+            &NewOrder::limit(ClientOrderId(i), Side::Buy, 999_999, 1),
+            &mut trades,
+            TS,
+        );
+        let _ = ob.submit(
+            &NewOrder::limit(ClientOrderId(i), Side::Buy, 100, 0),
+            &mut trades,
+            TS,
+        );
+        let _ = ob.submit(
+            &NewOrder::limit(ClientOrderId(i), Side::Buy, 100, 1),
+            &mut trades,
+            TS,
+        );
     }
     let (allocs, bytes) = alloc_guard::disarm();
 
-    assert_eq!(allocs, 0, "reject path allocated {allocs} times ({bytes} bytes)");
+    assert_eq!(
+        allocs, 0,
+        "reject path allocated {allocs} times ({bytes} bytes)"
+    );
 }
 
 /// 守住 alloc_guard 自己：counter 一定要係 thread-local。
@@ -155,8 +182,8 @@ fn rejects_allocate_nothing() {
 ///     會污染度量
 #[test]
 fn counter_is_isolated_per_thread() {
-    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     const WAIT: u8 = 0;
     const GO: u8 = 1;
@@ -206,4 +233,36 @@ fn counter_actually_counts() {
     std::hint::black_box((v, z));
     assert!(allocs >= 2, "expected at least 2 allocations, got {allocs}");
     assert!(bytes >= 4096 + 8192, "byte count too low: {bytes}");
+}
+
+#[test]
+fn amendments_and_atomic_rejects_allocate_nothing() {
+    let mut ob = book(16);
+    let mut out = TradeBuf::with_capacity(4);
+    let bid = ob
+        .submit(
+            &NewOrder::limit(ClientOrderId(1), Side::Buy, 99, 10),
+            &mut out,
+            TS,
+        )
+        .unwrap();
+    ob.submit(
+        &NewOrder::limit(ClientOrderId(2), Side::Sell, 100, 10),
+        &mut out,
+        TS,
+    )
+    .unwrap();
+    let mut full = TradeBuf::with_capacity(0);
+
+    alloc_guard::arm();
+    ob.amend(bid, 99, 5, &mut out, TS).unwrap();
+    ob.amend(bid, 99, 20, &mut out, TS).unwrap();
+    let reject = ob.amend(bid, 100, 20, &mut full, TS);
+    ob.amend(bid, 100, 20, &mut out, TS).unwrap();
+    ob.amend(bid, 100, 0, &mut out, TS).unwrap();
+    let (allocs, bytes) = alloc_guard::disarm();
+
+    assert_eq!(reject, Err(orderbook::OrderBookError::TradeBufferFull));
+    assert_eq!((allocs, bytes), (0, 0));
+    assert_eq!(ob.live_orders(), 0);
 }

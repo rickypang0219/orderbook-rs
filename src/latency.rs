@@ -9,8 +9,8 @@
 //!
 //! 1. **Workload 預先生成**：所有 `NewOrder` 同隨機數喺量度窗口**之前**
 //!    砌好。喺 loop 入面 call RNG 會把 RNG 嘅耗時計埋落 engine 度。
-//! 2. **Sample buffer 預先分配**：`Vec<u32>` 先 `resize` 到滿，量度期間
-//!    只做 index 寫入。排序喺 `disarm()` 之後先做。
+//! 2. **Sample buffer 預先分配**：`Vec<u32>` 預留容量，量度期間唔 grow。
+//!    排序喺 `disarm()` 之後先做。
 //! 3. **`alloc_guard` 全程 arm 住**：如果量度窗口本身有 allocation，
 //!    個 tail 就係量緊 allocator 而唔係 engine。每個 workload 都會報返
 //!    allocation count，唔係 0 就要當啲數唔算數。
@@ -27,7 +27,12 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use orderbook::alloc_guard;
-use orderbook::{BookConfig, ClientOrderId, NewOrder, OrderBook, OrderId, OrderType, Side, TradeBuf};
+use orderbook::{
+    BookConfig, ClientOrderId, NewOrder, OrderBook, OrderId, OrderType, Side, TradeBuf,
+};
+
+#[global_allocator]
+static ALLOC: alloc_guard::Counting = alloc_guard::Counting;
 
 // ------------------------------------------------------------------ 工具
 
@@ -129,7 +134,10 @@ fn report(label: &str, samples: &mut [u32], allocs: u64, bytes: u64, overhead: u
             commas(bytes)
         );
     }
-    println!("  (timer overhead ~{} 已包含喺每個 sample 入面)\n", ns(overhead));
+    println!(
+        "  (timer overhead ~{} 已包含喺每個 sample 入面)\n",
+        ns(overhead)
+    );
 }
 
 // ------------------------------------------------------------- workloads
@@ -156,12 +164,12 @@ fn add_shallow(n: usize, overhead: u32) {
     let mut samples: Vec<u32> = Vec::with_capacity(n);
 
     alloc_guard::arm();
-    for i in 0..n {
+    for req in &plan {
         trades.clear();
         let t = Instant::now();
-        let r = book.submit(&plan[i], &mut trades, 0);
+        let r = black_box(&mut book).submit(req, black_box(&mut trades), 0);
         samples.push(t.elapsed().as_nanos() as u32);
-        black_box(r.is_ok());
+        black_box(r).unwrap();
     }
     let (a, b) = alloc_guard::disarm();
     report("Add   (shallow: 1 level)", &mut samples, a, b, overhead);
@@ -199,12 +207,12 @@ fn add_deep(n: usize, levels: u32, warm: bool, overhead: u32) {
     let mut samples: Vec<u32> = Vec::with_capacity(n);
 
     alloc_guard::arm();
-    for i in 0..n {
+    for req in &plan {
         trades.clear();
         let t = Instant::now();
-        let r = book.submit(&plan[i], &mut trades, 0);
+        let r = black_box(&mut book).submit(req, black_box(&mut trades), 0);
         samples.push(t.elapsed().as_nanos() as u32);
-        black_box(r.is_ok());
+        black_box(r).unwrap();
     }
     let (a, b) = alloc_guard::disarm();
 
@@ -243,14 +251,20 @@ fn cancel_random(n: usize, levels: u32, overhead: u32) {
     let mut samples: Vec<u32> = Vec::with_capacity(n);
 
     alloc_guard::arm();
-    for i in 0..n {
+    for &id in &ids {
         let t = Instant::now();
-        let r = book.cancel(ids[i]);
+        let r = black_box(&mut book).cancel(id);
         samples.push(t.elapsed().as_nanos() as u32);
-        black_box(r.is_ok());
+        black_box(r).unwrap();
     }
     let (a, b) = alloc_guard::disarm();
-    report("Cancel (random order, deep book)", &mut samples, a, b, overhead);
+    report(
+        "Cancel (random order, deep book)",
+        &mut samples,
+        a,
+        b,
+        overhead,
+    );
 }
 
 /// 成交：book 掛滿多個價位，然後打入會 cross 嘅單。
@@ -286,13 +300,13 @@ fn match_deep(takers: usize, levels: u32, overhead: u32) {
     let mut fills = 0u64;
 
     alloc_guard::arm();
-    for i in 0..takers {
+    for req in &plan {
         trades.clear();
         let t = Instant::now();
-        let r = book.submit(&plan[i], &mut trades, 0);
+        let r = black_box(&mut book).submit(req, black_box(&mut trades), 0);
         samples.push(t.elapsed().as_nanos() as u32);
         fills += trades.len() as u64;
-        black_box(r.is_ok());
+        black_box(r).unwrap();
     }
     let (a, b) = alloc_guard::disarm();
     report(
@@ -302,7 +316,11 @@ fn match_deep(takers: usize, levels: u32, overhead: u32) {
         b,
         overhead,
     );
-    println!("  總成交筆數 {} ({:.2} 筆/單)\n", commas(fills), fills as f64 / takers as f64);
+    println!(
+        "  總成交筆數 {} ({:.2} 筆/單)\n",
+        commas(fills),
+        fills as f64 / takers as f64
+    );
 }
 
 /// 最貼近生產嘅 shape：60% 掛單 / 30% 撤單 / 10% 市價單。
@@ -338,19 +356,19 @@ fn mixed(n: usize, levels: u32, overhead: u32) {
     // live id ring：預先分配，量度期間唔會 grow
     let mut live: Vec<OrderId> = Vec::with_capacity(cap);
     let mut samples: Vec<u32> = Vec::with_capacity(n);
+    let mut stale_cancels: Vec<u32> = Vec::with_capacity(n);
 
     alloc_guard::arm();
-    for i in 0..n {
+    for &op in &plan {
         trades.clear();
-        match plan[i] {
+        match op {
             Op::Add(req) => {
                 let t = Instant::now();
-                let r = book.submit(&req, &mut trades, 0);
+                let r = black_box(&mut book).submit(&req, black_box(&mut trades), 0);
                 samples.push(t.elapsed().as_nanos() as u32);
-                if let Ok(id) = r {
-                    if book.get(id).is_some() {
-                        live.push(id);
-                    }
+                let id = r.unwrap();
+                if book.get(id).is_some() {
+                    live.push(id);
                 }
             }
             Op::Cancel(r) => {
@@ -360,27 +378,105 @@ fn mixed(n: usize, levels: u32, overhead: u32) {
                 let k = (r as usize) % live.len();
                 let id = live.swap_remove(k);
                 let t = Instant::now();
-                let res = book.cancel(id);
-                samples.push(t.elapsed().as_nanos() as u32);
-                black_box(res.is_ok());
+                let res = black_box(&mut book).cancel(id);
+                let elapsed = t.elapsed().as_nanos() as u32;
+                match res {
+                    Ok(()) => samples.push(elapsed),
+                    Err(orderbook::OrderBookError::OrderNotFound { .. }) => {
+                        stale_cancels.push(elapsed)
+                    }
+                    Err(e) => panic!("unexpected cancel failure: {e}"),
+                }
             }
             Op::Market(req) => {
                 let t = Instant::now();
-                let r = book.submit(&req, &mut trades, 0);
+                let r = black_box(&mut book).submit(&req, black_box(&mut trades), 0);
                 samples.push(t.elapsed().as_nanos() as u32);
-                black_box(r.is_ok());
+                black_box(r).unwrap();
             }
         }
     }
     let (a, b) = alloc_guard::disarm();
     report(
-        &format!("Mixed (60% add / 30% cancel / 10% market, {levels} levels)"),
+        &format!("Mixed (planned 60/30/10; successful operations, {levels} levels)"),
         &mut samples,
         a,
         b,
         overhead,
     );
-    println!("  收工時仲掛住 {} 張單\n", commas(book.live_orders() as u64));
+    if !stale_cancels.is_empty() {
+        report(
+            "Mixed stale-ID rejects (excluded above)",
+            &mut stale_cancels,
+            a,
+            b,
+            overhead,
+        );
+    }
+    println!(
+        "  收工時仲掛住 {} 張單\n",
+        commas(book.live_orders() as u64)
+    );
+}
+
+/// Separate priority-preserving reductions, increases and reprices.
+fn amend(n: usize, overhead: u32) {
+    for (label, price, qty) in [
+        ("Reduce", 100, 5),
+        ("Increase", 100, 20),
+        ("Reprice", 101, 10),
+    ] {
+        let mut book = OrderBook::with_config(cfg(n + 16, 4096));
+        let mut trades = TradeBuf::default();
+        let ids: Vec<_> = (0..n)
+            .map(|i| {
+                book.submit(
+                    &NewOrder::limit(ClientOrderId(i as u64), Side::Buy, 100, 10),
+                    &mut trades,
+                    0,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut samples = Vec::with_capacity(n);
+        alloc_guard::arm();
+        for id in ids {
+            let t = Instant::now();
+            let result = black_box(&mut book).amend(id, price, qty, black_box(&mut trades), 0);
+            samples.push(t.elapsed().as_nanos() as u32);
+            black_box(result).unwrap();
+        }
+        let (a, b) = alloc_guard::disarm();
+        report(label, &mut samples, a, b, overhead);
+    }
+}
+
+/// One order per tick isolates occupancy transitions from existing-level updates.
+fn level_transitions(n: usize, overhead: u32) {
+    let mut book = OrderBook::with_config(cfg(n + 16, n));
+    let mut trades = TradeBuf::default();
+    let mut ids = Vec::with_capacity(n);
+    let mut samples = Vec::with_capacity(n);
+    alloc_guard::arm();
+    for i in 0..n {
+        let req = NewOrder::limit(ClientOrderId(i as u64), Side::Buy, i as i64, 1);
+        let t = Instant::now();
+        let result = black_box(&mut book).submit(&req, black_box(&mut trades), 0);
+        samples.push(t.elapsed().as_nanos() as u32);
+        ids.push(result.unwrap());
+    }
+    let (a, b) = alloc_guard::disarm();
+    report("Add (new price level)", &mut samples, a, b, overhead);
+    samples.clear();
+    alloc_guard::arm();
+    for id in ids {
+        let t = Instant::now();
+        let result = black_box(&mut book).cancel(id);
+        samples.push(t.elapsed().as_nanos() as u32);
+        black_box(result).unwrap();
+    }
+    let (a, b) = alloc_guard::disarm();
+    report("Cancel (last order at level)", &mut samples, a, b, overhead);
 }
 
 // ------------------------------------------------------------------ main
@@ -390,10 +486,17 @@ fn main() {
 
     let overhead = calibrate(100_000);
     println!("=================================================================");
-    println!(" Latency distribution   ({} ops per workload)", commas(n as u64));
-    println!(" Timer overhead (median Instant::now + elapsed): {}", ns(overhead));
-    println!(" 每個 sample 都含住呢個 overhead。p50 要減返佢先係真實成本；");
-    println!(" 但 tail（p99.9 以上）係微秒級，overhead 可以忽略。");
+    println!(
+        " Latency distribution   ({} ops per workload)",
+        commas(n as u64)
+    );
+    println!(
+        " Timer overhead (median Instant::now + elapsed): {}",
+        ns(overhead)
+    );
+    println!(
+        " Samples include timer overhead; do not subtract percentiles as an exact correction."
+    );
     println!("=================================================================\n");
 
     add_shallow(n, overhead);
@@ -402,6 +505,8 @@ fn main() {
     cancel_random(n, 2_000, overhead);
     match_deep(n / 2, 2_000, overhead);
     mixed(n, 2_000, overhead);
+    amend(n, overhead);
+    level_transitions(65_536, overhead);
 
     println!("提示：測量前把機器靜落嚟（關 Spotlight indexing、瀏覽器），");
     println!("      macOS 上仲可以用 `sudo nice -n -20` 減少被搶佔。");

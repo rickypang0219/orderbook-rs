@@ -63,7 +63,7 @@ impl fmt::Display for TradeId {
     }
 }
 
-/// Client 提供（FIX tag 11）。Engine 只做 uniqueness check，唔會自己生。
+/// Client-provided metadata (FIX tag 11); uniqueness belongs to the caller.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct ClientOrderId(pub u64);
 
